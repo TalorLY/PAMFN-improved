@@ -1,0 +1,13 @@
+*/__pycache__
+__pycache__/
+data/
+pretrained_models/
+*.pyc
+*.log
+debug.ipynb
+.pytest_cache/
+RG_skeleton_npy.zip
+RG_skeleton_npy/
+skeleton_npy/
+HANDOFF.md
+7.6总结.md
