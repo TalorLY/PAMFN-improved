@@ -313,10 +313,8 @@ class PAMFN(nn.Module):
             shared_rank_weight=0.0, shared_rank_margin=0.02,
             shared_rank_temperature=0.05, shared_list_weight=0.0,
             shared_list_margin=0.02, shared_list_temperature=0.05,
-            ordinal_grade_weight=0.0,
             ordinal_prototype_weight=0.0,
             ordinal_quality_thresholds=(),
-            ordinal_num_grades=4,
             ordinal_prototype_dim=128,
             ordinal_prototype_temperature=0.1,
             ordinal_prototype_order_margin=0.1,
@@ -327,7 +325,6 @@ class PAMFN(nn.Module):
                 ("shared_rank_margin", shared_rank_margin),
                 ("shared_list_weight", shared_list_weight),
                 ("shared_list_margin", shared_list_margin),
-                ("ordinal_grade_weight", ordinal_grade_weight),
                 ("ordinal_prototype_weight",
                  ordinal_prototype_weight),
                 ("ordinal_prototype_order_margin",
@@ -350,10 +347,6 @@ class PAMFN(nn.Module):
             raise ValueError(
                 "ordinal_prototype_dim must be positive"
             )
-        if ordinal_num_grades < 2:
-            raise ValueError(
-                "ordinal_num_grades must be at least 2"
-            )
         if not np.isfinite(ordinal_prototype_temperature) or (
                 ordinal_prototype_temperature <= 0):
             raise ValueError(
@@ -365,26 +358,25 @@ class PAMFN(nn.Module):
             for value in (
                 shared_rank_weight,
                 shared_list_weight,
-                ordinal_grade_weight,
                 ordinal_prototype_weight,
             )
         )
         if active_objectives > 1:
             raise ValueError(
-                "pairwise, List-wise, grade-head, and prototype "
-                "supervision are mutually exclusive"
+                "pairwise, List-wise, and prototype supervision are "
+                "mutually exclusive"
             )
-        if ordinal_grade_weight > 0 or ordinal_prototype_weight > 0:
+        if ordinal_prototype_weight > 0:
             thresholds = np.asarray(
                 ordinal_quality_thresholds, dtype=np.float64
             )
             if (
-                    thresholds.shape != (ordinal_num_grades - 1,)
+                    thresholds.shape != (3,)
                     or not np.isfinite(thresholds).all()
                     or not np.all(thresholds[:-1] < thresholds[1:])):
                 raise ValueError(
-                    "ordinal_quality_thresholds must contain "
-                    "ordinal_num_grades - 1 finite increasing values"
+                    "ordinal_quality_thresholds must contain three "
+                    "finite increasing values"
                 )
 
         self.shared_rank_weight = float(shared_rank_weight)
@@ -397,11 +389,9 @@ class PAMFN(nn.Module):
         self.shared_list_temperature = float(
             shared_list_temperature
         )
-        self.ordinal_grade_weight = float(ordinal_grade_weight)
         self.ordinal_prototype_weight = float(
             ordinal_prototype_weight
         )
-        self.ordinal_num_grades = int(ordinal_num_grades)
         self.ordinal_prototype_temperature = float(
             ordinal_prototype_temperature
         )
@@ -450,12 +440,18 @@ class PAMFN(nn.Module):
         )
         self.tau = nn.Parameter(torch.ones([]) * 10)
         self.mse = nn.MSELoss()
-        if (
-                self.ordinal_grade_weight > 0
-                or self.ordinal_prototype_weight > 0):
+        if self.ordinal_prototype_weight > 0:
             self.quality_projector = nn.Linear(
                 model_dim * 3, ordinal_prototype_dim
             )
+            self.quality_prototypes = nn.Parameter(
+                torch.empty(4, ordinal_prototype_dim)
+            )
+            self.quality_axis = nn.Parameter(
+                torch.empty(ordinal_prototype_dim)
+            )
+            nn.init.normal_(self.quality_prototypes, std=0.02)
+            nn.init.normal_(self.quality_axis, std=0.02)
             self.register_buffer(
                 "ordinal_thresholds",
                 torch.tensor(
@@ -463,24 +459,7 @@ class PAMFN(nn.Module):
                     dtype=torch.float32,
                 ),
             )
-        if self.ordinal_grade_weight > 0:
-            self.quality_classifier = nn.Linear(
-                ordinal_prototype_dim,
-                self.ordinal_num_grades,
-                bias=False,
-            )
-        if self.ordinal_prototype_weight > 0:
-            self.quality_prototypes = nn.Parameter(
-                torch.empty(
-                    self.ordinal_num_grades,
-                    ordinal_prototype_dim,
-                )
-            )
-            self.quality_axis = nn.Parameter(
-                torch.empty(ordinal_prototype_dim)
-            )
-            nn.init.normal_(self.quality_prototypes, std=0.02)
-            nn.init.normal_(self.quality_axis, std=0.02)
+
     def forward(self, input_feats):
         _, feat_r = self.model_r(input_feats)
         _, feat_a = self.model_a(input_feats)
@@ -519,18 +498,11 @@ class PAMFN(nn.Module):
         )
         score = self.fc(stage3).squeeze(dim=2)
         info = {"action": [action1, action2, action3]}
-        if (
-                self.ordinal_grade_weight > 0
-                or self.ordinal_prototype_weight > 0):
-            quality_embedding = F.normalize(
+        if self.ordinal_prototype_weight > 0:
+            info["quality_embedding"] = F.normalize(
                 self.quality_projector(stage3.squeeze(dim=2)),
                 dim=1,
             )
-            info["quality_embedding"] = quality_embedding
-            if self.ordinal_grade_weight > 0:
-                info["quality_logits"] = self.quality_classifier(
-                    quality_embedding
-                )
         return score, info
 
     def call_loss(self, prediction, label, **kwargs):
@@ -538,22 +510,11 @@ class PAMFN(nn.Module):
         return self.mse(prediction.squeeze(), label.squeeze())
 
     def call_training_loss(
-            self, prediction, label, **kwargs):
-        return self.call_training_loss_components(
-            prediction, label, **kwargs
-        )["objective"]
-
-    def call_training_loss_components(
-            self, prediction, label, quality_embedding=None,
-            quality_logits=None, **kwargs):
+            self, prediction, label, quality_embedding=None, **kwargs):
         del kwargs
         prediction = prediction.reshape(-1)
         label = label.reshape(-1)
         score_loss = self.mse(prediction, label)
-        components = {
-            "score_mse": score_loss,
-            "objective": score_loss,
-        }
         if self.shared_rank_weight > 0:
             rank_loss = self._pairwise_rank_loss(
                 prediction,
@@ -561,13 +522,7 @@ class PAMFN(nn.Module):
                 min_label_gap=self.shared_rank_margin,
                 temperature=self.shared_rank_temperature,
             )
-            weighted = self.shared_rank_weight * rank_loss
-            components.update({
-                "rank_loss": rank_loss,
-                "weighted_auxiliary": weighted,
-                "objective": score_loss + weighted,
-            })
-            return components
+            return score_loss + self.shared_rank_weight * rank_loss
         if self.shared_list_weight > 0:
             list_loss = self._grouped_listmle_loss(
                 prediction,
@@ -575,118 +530,21 @@ class PAMFN(nn.Module):
                 tie_range=self.shared_list_margin,
                 temperature=self.shared_list_temperature,
             )
-            weighted = self.shared_list_weight * list_loss
-            components.update({
-                "list_loss": list_loss,
-                "weighted_auxiliary": weighted,
-                "objective": score_loss + weighted,
-            })
-            return components
-        if self.ordinal_grade_weight > 0:
-            if quality_logits is None:
-                raise ValueError(
-                    "quality_logits is required for grade-head loss"
-                )
-            grade_loss = self._ordinal_grade_loss(
-                quality_logits, label
-            )
-            weighted = self.ordinal_grade_weight * grade_loss
-            components.update({
-                "grade_classification": grade_loss,
-                "weighted_auxiliary": weighted,
-                "objective": score_loss + weighted,
-            })
-            return components
+            return score_loss + self.shared_list_weight * list_loss
         if self.ordinal_prototype_weight > 0:
             if quality_embedding is None:
                 raise ValueError(
                     "quality_embedding is required for prototype loss"
                 )
-            prototype_loss, order_loss = (
-                self._ordinal_prototype_loss_components(
-                    quality_embedding,
-                    label,
-                )
+            prototype_loss = self._ordinal_prototype_loss(
+                quality_embedding,
+                label,
             )
-            auxiliary = (
-                prototype_loss
-                + self.ordinal_prototype_order_scale * order_loss
+            return (
+                score_loss
+                + self.ordinal_prototype_weight * prototype_loss
             )
-            weighted = self.ordinal_prototype_weight * auxiliary
-            components.update({
-                "prototype_classification": prototype_loss,
-                "prototype_order": order_loss,
-                "weighted_auxiliary": weighted,
-                "objective": score_loss + weighted,
-            })
-            return components
-        return components
-
-    def _ordinal_soft_targets(self, target, dtype):
-        bins = torch.bucketize(
-            target.detach(), self.ordinal_thresholds
-        )
-        class_ids = torch.arange(
-            self.ordinal_thresholds.numel() + 1,
-            device=target.device,
-        ).unsqueeze(0)
-        distance = (class_ids - bins.unsqueeze(1)).abs()
-        soft_target = torch.where(
-            distance == 0,
-            torch.ones_like(distance, dtype=dtype),
-            torch.where(
-                distance == 1,
-                torch.full_like(distance, 0.1, dtype=dtype),
-                torch.zeros_like(distance, dtype=dtype),
-            ),
-        )
-        return soft_target / soft_target.sum(
-            dim=1, keepdim=True
-        )
-
-    def _ordinal_grade_loss(self, logits, target):
-        soft_target = self._ordinal_soft_targets(
-            target, logits.dtype
-        )
-        return -(
-            soft_target * F.log_softmax(logits, dim=1)
-        ).sum(dim=1).mean()
-
-    def _ordinal_prototype_loss_components(
-            self, embedding, target):
-        prototypes = F.normalize(
-            self.quality_prototypes, dim=1
-        )
-        logits = (
-            embedding @ prototypes.transpose(0, 1)
-            / self.ordinal_prototype_temperature
-        )
-        soft_target = self._ordinal_soft_targets(
-            target, embedding.dtype
-        )
-        prototype_loss = -(
-            soft_target * F.log_softmax(logits, dim=1)
-        ).sum(dim=1).mean()
-
-        axis = F.normalize(self.quality_axis, dim=0)
-        positions = prototypes @ axis
-        gaps = positions[1:] - positions[:-1]
-        order_loss = F.relu(
-            self.ordinal_prototype_order_margin - gaps
-        ).mean()
-        return prototype_loss, order_loss
-
-    def _ordinal_prototype_loss(self, embedding, target):
-        prototype_loss, order_loss = (
-            self._ordinal_prototype_loss_components(
-                embedding,
-                target,
-            )
-        )
-        return (
-            prototype_loss
-            + self.ordinal_prototype_order_scale * order_loss
-        )
+        return score_loss
 
     def _pairwise_rank_loss(
             self, prediction, target, min_label_gap=1e-8,
@@ -748,3 +606,47 @@ class PAMFN(nn.Module):
             for index in range(len(group_scores) - 1)
         ]
         return torch.stack(terms).mean()
+
+    def _ordinal_prototype_loss(self, embedding, target):
+        prototypes = F.normalize(
+            self.quality_prototypes, dim=1
+        )
+        logits = (
+            embedding @ prototypes.transpose(0, 1)
+            / self.ordinal_prototype_temperature
+        )
+        bins = torch.bucketize(
+            target.detach(), self.ordinal_thresholds
+        )
+        class_ids = torch.arange(
+            4, device=target.device
+        ).unsqueeze(0)
+        distance = (class_ids - bins.unsqueeze(1)).abs()
+        soft_target = torch.where(
+            distance == 0,
+            torch.ones_like(distance, dtype=embedding.dtype),
+            torch.where(
+                distance == 1,
+                torch.full_like(
+                    distance, 0.1, dtype=embedding.dtype
+                ),
+                torch.zeros_like(distance, dtype=embedding.dtype),
+            ),
+        )
+        soft_target = soft_target / soft_target.sum(
+            dim=1, keepdim=True
+        )
+        prototype_loss = -(
+            soft_target * F.log_softmax(logits, dim=1)
+        ).sum(dim=1).mean()
+
+        axis = F.normalize(self.quality_axis, dim=0)
+        positions = prototypes @ axis
+        gaps = positions[1:] - positions[:-1]
+        order_loss = F.relu(
+            self.ordinal_prototype_order_margin - gaps
+        ).mean()
+        return (
+            prototype_loss
+            + self.ordinal_prototype_order_scale * order_loss
+        )

@@ -52,18 +52,14 @@ def read_labels(dataset_name, is_train):
     return labels
 
 
-def get_train_quality_thresholds(dataset_name, num_grades=4):
-    if num_grades < 2:
-        raise ValueError("num_grades must be at least 2")
+def get_train_quality_thresholds(dataset_name):
     values = np.asarray(
         [label for _, label in read_labels(dataset_name, True)],
         dtype=np.float64,
     )
-    quantiles = np.arange(1, num_grades, dtype=np.float64)
-    quantiles /= num_grades
     return tuple(
         float(value)
-        for value in np.quantile(values, quantiles)
+        for value in np.quantile(values, (0.25, 0.50, 0.75))
     )
 
 

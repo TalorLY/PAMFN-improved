@@ -74,15 +74,6 @@ def parser_args():
         help="temperature of the grouped ListMLE loss",
     )
     parser.add_argument(
-        "--ordinal_grade_weight",
-        type=float,
-        default=0.0,
-        help=(
-            "training-only parameter-matched grade auxiliary "
-            "head; zero preserves the official PAMFN objective"
-        ),
-    )
-    parser.add_argument(
         "--ordinal_prototype_weight",
         type=float,
         default=0.0,
@@ -95,12 +86,6 @@ def parser_args():
         "--ordinal_prototype_dim",
         type=int,
         default=128,
-    )
-    parser.add_argument(
-        "--ordinal_num_grades",
-        type=int,
-        default=4,
-        help="number of train-quantile quality grades",
     )
     parser.add_argument(
         "--ordinal_prototype_temperature",
@@ -132,7 +117,6 @@ def validate_args(parser, args):
             ("--shared_rank_margin", args.shared_rank_margin),
             ("--shared_list_weight", args.shared_list_weight),
             ("--shared_list_margin", args.shared_list_margin),
-            ("--ordinal_grade_weight", args.ordinal_grade_weight),
             ("--ordinal_prototype_weight",
              args.ordinal_prototype_weight),
             ("--ordinal_prototype_order_margin",
@@ -143,8 +127,6 @@ def validate_args(parser, args):
             parser.error(f"{name} must be finite and non-negative")
     if args.ordinal_prototype_dim < 1:
         parser.error("--ordinal_prototype_dim must be positive")
-    if args.ordinal_num_grades < 2:
-        parser.error("--ordinal_num_grades must be at least 2")
     if (
             not math.isfinite(args.shared_rank_temperature)
             or args.shared_rank_temperature <= 0):
@@ -168,14 +150,13 @@ def validate_args(parser, args):
         for value in (
             args.shared_rank_weight,
             args.shared_list_weight,
-            args.ordinal_grade_weight,
             args.ordinal_prototype_weight,
         )
     )
     if active_objectives > 1:
         parser.error(
-            "pairwise, List-wise, grade-head, and prototype "
-            "supervision are mutually exclusive"
+            "pairwise, List-wise, and prototype supervision are "
+            "mutually exclusive"
         )
     if (
             active_objectives > 0
@@ -245,22 +226,12 @@ def build_configs(args, config):
                 "shared_list_margin": args.shared_list_margin,
                 "shared_list_temperature":
                     args.shared_list_temperature,
-                "ordinal_grade_weight":
-                    args.ordinal_grade_weight,
                 "ordinal_prototype_weight":
                     args.ordinal_prototype_weight,
                 "ordinal_quality_thresholds": (
-                    get_train_quality_thresholds(
-                        args.action,
-                        args.ordinal_num_grades,
-                    )
-                    if (
-                        args.ordinal_grade_weight > 0
-                        or args.ordinal_prototype_weight > 0
-                    ) else ()
+                    get_train_quality_thresholds(args.action)
+                    if args.ordinal_prototype_weight > 0 else ()
                 ),
-                "ordinal_num_grades":
-                    args.ordinal_num_grades,
                 "ordinal_prototype_dim":
                     args.ordinal_prototype_dim,
                 "ordinal_prototype_temperature":
@@ -329,41 +300,18 @@ def log_configuration(log_func, args, epoch_num):
             f"tie_range<={args.shared_list_margin:g}; "
             f"temperature={args.shared_list_temperature:g}"
         )
-    elif args.ordinal_grade_weight > 0:
-        thresholds = get_train_quality_thresholds(
-            args.action, args.ordinal_num_grades
-        )
-        grade_head_name = (
-            "four-grade head"
-            if args.ordinal_num_grades == 4
-            else "grade head"
-        )
-        log_func(
-            "Training objective: official MSE + "
-            f"{args.ordinal_grade_weight:g}*{grade_head_name}; "
-            f"grades={args.ordinal_num_grades}; "
-            f"dim={args.ordinal_prototype_dim}; "
-            "adjacent_soft_target=0.1"
-        )
-        log_func(
-            "Train-only quality quantiles: "
-            + ", ".join(f"{value:.6f}" for value in thresholds)
-        )
     elif args.ordinal_prototype_weight > 0:
-        thresholds = get_train_quality_thresholds(
-            args.action, args.ordinal_num_grades
-        )
+        thresholds = get_train_quality_thresholds(args.action)
         log_func(
             "Training objective: official MSE + "
             f"{args.ordinal_prototype_weight:g}*ordinal prototypes; "
-            f"grades={args.ordinal_num_grades}; "
             f"dim={args.ordinal_prototype_dim}; "
             f"temperature={args.ordinal_prototype_temperature:g}; "
             f"order_margin={args.ordinal_prototype_order_margin:g}; "
             f"order_scale={args.ordinal_prototype_order_scale:g}"
         )
         log_func(
-            "Train-only quality quantiles: "
+            "Train-only quality quartiles: "
             + ", ".join(f"{value:.6f}" for value in thresholds)
         )
     else:

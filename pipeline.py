@@ -7,6 +7,7 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 
 from datasets import AQADataset
+from utils.lr_scheduler import build_scheduler
 from utils.utils import AverageMeter
 
 
@@ -99,10 +100,6 @@ def build_optimizer(
 def build_lr_scheduler(
         optimizer, scheduler, epoch_num, scheduler_steps,
         lr_min=5e-6, warmup_lr_init=5e-6, decay_rate=0.1):
-    if scheduler == "none":
-        return None
-    from utils.lr_scheduler import build_scheduler
-
     return build_scheduler(
         optimizer,
         scheduler,
@@ -139,7 +136,6 @@ def train_epoch(
         current_epoch, clip_grad=False):
     objective_losses = AverageMeter()
     mse_losses = AverageMeter()
-    component_losses = {}
     predictions = []
     labels = []
     start = time.time()
@@ -149,22 +145,12 @@ def train_epoch(
     for batch in dataloader:
         model_input, label = _prepare_batch(batch, device)
         prediction, other_info = model(model_input)
-        component_fn = getattr(
-            model, "call_training_loss_components", None
+        training_loss = getattr(
+            model, "call_training_loss", model.call_loss
         )
-        if component_fn is None:
-            training_loss = getattr(
-                model, "call_training_loss", model.call_loss
-            )
-            objective = training_loss(
-                prediction, label, **other_info
-            )
-            components = {}
-        else:
-            components = component_fn(
-                prediction, label, **other_info
-            )
-            objective = components["objective"]
+        objective = training_loss(
+            prediction, label, **other_info
+        )
         mse = torch.mean(
             (prediction.reshape(-1) - label.reshape(-1)) ** 2
         )
@@ -178,12 +164,6 @@ def train_epoch(
         batch_size = label.shape[0]
         objective_losses.update(objective.item(), batch_size)
         mse_losses.update(mse.detach().item(), batch_size)
-        for name, value in components.items():
-            if name == "objective":
-                continue
-            component_losses.setdefault(
-                name, AverageMeter()
-            ).update(value.detach().item(), batch_size)
         predictions.extend(
             prediction.detach().cpu().reshape(-1).tolist()
         )
@@ -195,10 +175,6 @@ def train_epoch(
         "time": time.time() - start,
         "mse_x100": mse_losses.avg * 100,
         "objective_x100": objective_losses.avg * 100,
-        "components": {
-            name: meter.avg
-            for name, meter in component_losses.items()
-        },
         # Match the official training-side scale in the epoch log.
         "coef": _spearman(predictions, labels),
     }
@@ -229,42 +205,7 @@ def test_epoch(model, dataloader):
         "time": time.time() - start,
         "loss_x100": losses.avg * 100,
         "coef": _spearman(predictions, labels) * 100,
-        "prediction_std": float(np.std(predictions)),
     }
-
-
-def _format_loss_components(components):
-    if "grade_classification" in components:
-        return (
-            "GradeCE {grade:.4f} AuxX100 {weighted:.4f} \t"
-        ).format(
-            grade=components["grade_classification"],
-            weighted=components["weighted_auxiliary"] * 100,
-        )
-    if "prototype_classification" in components:
-        return (
-            "ProtoCE {prototype:.4f} Order {order:.4f} "
-            "AuxX100 {weighted:.4f} \t"
-        ).format(
-            prototype=components["prototype_classification"],
-            order=components["prototype_order"],
-            weighted=components["weighted_auxiliary"] * 100,
-        )
-    if "rank_loss" in components:
-        return (
-            "RankLoss {loss:.4f} AuxX100 {weighted:.4f} \t"
-        ).format(
-            loss=components["rank_loss"],
-            weighted=components["weighted_auxiliary"] * 100,
-        )
-    if "list_loss" in components:
-        return (
-            "ListLoss {loss:.4f} AuxX100 {weighted:.4f} \t"
-        ).format(
-            loss=components["list_loss"],
-            weighted=components["weighted_auxiliary"] * 100,
-        )
-    return ""
 
 
 def _ensure_parent(path):
@@ -285,7 +226,6 @@ def train_loop(
     coefficient_of_saved_model = 0.0
     test_losses = []
     test_coefs = []
-    nan_coef_epochs = 0
 
     for current_epoch in range(epoch_num):
         train_result = train_epoch(
@@ -299,9 +239,6 @@ def train_loop(
         test_result = test_epoch(model, test_dataloader)
         test_losses.append(test_result["loss_x100"])
         test_coefs.append(test_result["coef"])
-        nan_coef_epochs += int(
-            not np.isfinite(test_result["coef"])
-        )
         average_loss = np.mean(test_losses[-10:])
         average_coef = np.mean(test_coefs[-10:])
 
@@ -327,18 +264,13 @@ def train_loop(
         max_avg_coef = max(max_avg_coef, average_coef)
         min_loss = min(min_loss, test_result["loss_x100"])
         min_avg_loss = min(min_avg_loss, average_loss)
-        component_text = _format_loss_components(
-            train_result["components"]
-        )
         log_func(
             "Epoch[{0}/{1}] \t"
             "Time: {train_time:.1f}/{test_time:.1f} \t"
             "Loss {train_loss:.4f}/{test_loss:.4f} \t"
             "Objective {objective:.4f} \t"
-            "{component_text}"
             "Avg_loss {avg_loss:.2f}/{min_avg_loss:.2f}\t"
             "Coef {train_coef:.2f}/{test_coef:.2f} \t"
-            "TestStd {prediction_std:.6f} \t"
             "Avg_coef {avg_coef:.2f}/{max_avg_coef:.2f} \t"
             "BestCoef {max_coef:.2f}\t BestLoss {min_loss:.2f}\t".format(
                 current_epoch,
@@ -348,12 +280,10 @@ def train_loop(
                 train_loss=train_result["mse_x100"],
                 test_loss=test_result["loss_x100"],
                 objective=train_result["objective_x100"],
-                component_text=component_text,
                 avg_loss=average_loss,
                 min_avg_loss=min_avg_loss,
                 train_coef=train_result["coef"],
                 test_coef=test_result["coef"],
-                prediction_std=test_result["prediction_std"],
                 avg_coef=average_coef,
                 max_avg_coef=max_avg_coef,
                 max_coef=max_coef,
@@ -361,9 +291,6 @@ def train_loop(
             )
         )
 
-    log_func(
-        f"evaluation diagnostics: nan coef epochs={nan_coef_epochs}"
-    )
     return (
         max_avg_coef,
         max_coef,
