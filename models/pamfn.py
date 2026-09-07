@@ -1,9 +1,15 @@
 import os.path as osp
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.coqm import (
+    ContinuousOrderedQualityManifold,
+    preserve_torch_rng_state,
+)
 
 
 def _torch_load(path):
@@ -318,7 +324,13 @@ class PAMFN(nn.Module):
             ordinal_prototype_dim=128,
             ordinal_prototype_temperature=0.1,
             ordinal_prototype_order_margin=0.1,
-            ordinal_prototype_order_scale=0.1):
+            ordinal_prototype_order_scale=0.1,
+            ordinal_prototype_target_mode="discrete",
+            ordinal_grade_centers=(),
+            quality_aux_rng_isolated=False,
+            coqm_weight=0.0, coqm_dim=128,
+            coqm_temperature=0.1, coqm_theta_max=np.pi / 3,
+            coqm_coord_scale=1.0):
         super().__init__()
         for name, value in (
                 ("shared_rank_weight", shared_rank_weight),
@@ -330,7 +342,9 @@ class PAMFN(nn.Module):
                 ("ordinal_prototype_order_margin",
                  ordinal_prototype_order_margin),
                 ("ordinal_prototype_order_scale",
-                 ordinal_prototype_order_scale)):
+                 ordinal_prototype_order_scale),
+                ("coqm_weight", coqm_weight),
+                ("coqm_coord_scale", coqm_coord_scale)):
             if not np.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if not np.isfinite(shared_rank_temperature) or (
@@ -353,17 +367,32 @@ class PAMFN(nn.Module):
                 "ordinal_prototype_temperature must be finite and "
                 "positive"
             )
+        if ordinal_prototype_target_mode not in (
+                "discrete", "continuous"):
+            raise ValueError(
+                "ordinal_prototype_target_mode must be discrete or continuous"
+            )
+        if coqm_dim < 2:
+            raise ValueError("coqm_dim must be at least two")
+        if not np.isfinite(coqm_temperature) or coqm_temperature <= 0:
+            raise ValueError("coqm_temperature must be finite and positive")
+        if (
+                not np.isfinite(coqm_theta_max)
+                or coqm_theta_max <= 0
+                or coqm_theta_max > np.pi / 2):
+            raise ValueError("coqm_theta_max must be in (0, pi / 2]")
         active_objectives = sum(
             value > 0
             for value in (
                 shared_rank_weight,
                 shared_list_weight,
                 ordinal_prototype_weight,
+                coqm_weight,
             )
         )
         if active_objectives > 1:
             raise ValueError(
-                "pairwise, List-wise, and prototype supervision are "
+                "pairwise, List-wise, prototype, and COQM supervision are "
                 "mutually exclusive"
             )
         if ordinal_prototype_weight > 0:
@@ -378,6 +407,18 @@ class PAMFN(nn.Module):
                     "ordinal_quality_thresholds must contain three "
                     "finite increasing values"
                 )
+            if ordinal_prototype_target_mode == "continuous":
+                centers = np.asarray(
+                    ordinal_grade_centers, dtype=np.float64
+                )
+                if (
+                        centers.shape != (4,)
+                        or not np.isfinite(centers).all()
+                        or not np.all(centers[:-1] < centers[1:])):
+                    raise ValueError(
+                        "continuous prototype targets require four "
+                        "finite increasing grade centers"
+                    )
 
         self.shared_rank_weight = float(shared_rank_weight)
         self.shared_rank_margin = float(shared_rank_margin)
@@ -401,6 +442,14 @@ class PAMFN(nn.Module):
         self.ordinal_prototype_order_scale = float(
             ordinal_prototype_order_scale
         )
+        self.ordinal_prototype_target_mode = str(
+            ordinal_prototype_target_mode
+        )
+        self.quality_aux_rng_isolated = bool(
+            quality_aux_rng_isolated
+        )
+        self.coqm_weight = float(coqm_weight)
+        self.coqm_coord_scale = float(coqm_coord_scale)
         self.model_r = _torch_load(osp.join(
             ckpt_dir,
             f"{dataset_name}_rgb_{rgb_ckpt_name}.pth",
@@ -441,23 +490,43 @@ class PAMFN(nn.Module):
         self.tau = nn.Parameter(torch.ones([]) * 10)
         self.mse = nn.MSELoss()
         if self.ordinal_prototype_weight > 0:
-            self.quality_projector = nn.Linear(
-                model_dim * 3, ordinal_prototype_dim
+            context = (
+                preserve_torch_rng_state()
+                if self.quality_aux_rng_isolated else nullcontext()
             )
-            self.quality_prototypes = nn.Parameter(
-                torch.empty(4, ordinal_prototype_dim)
-            )
-            self.quality_axis = nn.Parameter(
-                torch.empty(ordinal_prototype_dim)
-            )
-            nn.init.normal_(self.quality_prototypes, std=0.02)
-            nn.init.normal_(self.quality_axis, std=0.02)
+            with context:
+                self.quality_projector = nn.Linear(
+                    model_dim * 3, ordinal_prototype_dim
+                )
+                self.quality_prototypes = nn.Parameter(
+                    torch.empty(4, ordinal_prototype_dim)
+                )
+                self.quality_axis = nn.Parameter(
+                    torch.empty(ordinal_prototype_dim)
+                )
+                nn.init.normal_(self.quality_prototypes, std=0.02)
+                nn.init.normal_(self.quality_axis, std=0.02)
             self.register_buffer(
                 "ordinal_thresholds",
                 torch.tensor(
                     ordinal_quality_thresholds,
                     dtype=torch.float32,
                 ),
+            )
+            if self.ordinal_prototype_target_mode == "continuous":
+                self.register_buffer(
+                    "ordinal_grade_centers",
+                    torch.tensor(
+                        ordinal_grade_centers, dtype=torch.float32
+                    ),
+                )
+        if self.coqm_weight > 0:
+            self.coqm = ContinuousOrderedQualityManifold(
+                input_dim=model_dim * 3,
+                embedding_dim=coqm_dim,
+                num_anchors=4,
+                temperature=coqm_temperature,
+                theta_max=coqm_theta_max,
             )
 
     def forward(self, input_feats):
@@ -503,6 +572,10 @@ class PAMFN(nn.Module):
                 self.quality_projector(stage3.squeeze(dim=2)),
                 dim=1,
             )
+        if self.coqm_weight > 0:
+            info["coqm_output"] = self.coqm(
+                stage3.squeeze(dim=2)
+            )
         return score, info
 
     def call_loss(self, prediction, label, **kwargs):
@@ -510,7 +583,8 @@ class PAMFN(nn.Module):
         return self.mse(prediction.squeeze(), label.squeeze())
 
     def call_training_loss(
-            self, prediction, label, quality_embedding=None, **kwargs):
+            self, prediction, label, quality_embedding=None,
+            coqm_output=None, **kwargs):
         del kwargs
         prediction = prediction.reshape(-1)
         label = label.reshape(-1)
@@ -544,6 +618,13 @@ class PAMFN(nn.Module):
                 score_loss
                 + self.ordinal_prototype_weight * prototype_loss
             )
+        if self.coqm_weight > 0:
+            if coqm_output is None:
+                raise ValueError("coqm_output is required for COQM loss")
+            components = self.coqm.loss_components(
+                coqm_output, label, coord_scale=self.coqm_coord_scale
+            )
+            return score_loss + self.coqm_weight * components["total"]
         return score_loss
 
     def _pairwise_rank_loss(
@@ -615,27 +696,32 @@ class PAMFN(nn.Module):
             embedding @ prototypes.transpose(0, 1)
             / self.ordinal_prototype_temperature
         )
-        bins = torch.bucketize(
-            target.detach(), self.ordinal_thresholds
-        )
-        class_ids = torch.arange(
-            4, device=target.device
-        ).unsqueeze(0)
-        distance = (class_ids - bins.unsqueeze(1)).abs()
-        soft_target = torch.where(
-            distance == 0,
-            torch.ones_like(distance, dtype=embedding.dtype),
-            torch.where(
-                distance == 1,
-                torch.full_like(
-                    distance, 0.1, dtype=embedding.dtype
+        if self.ordinal_prototype_target_mode == "continuous":
+            soft_target = self._continuous_prototype_targets(
+                target, embedding.dtype
+            )
+        else:
+            bins = torch.bucketize(
+                target.detach(), self.ordinal_thresholds
+            )
+            class_ids = torch.arange(
+                4, device=target.device
+            ).unsqueeze(0)
+            distance = (class_ids - bins.unsqueeze(1)).abs()
+            soft_target = torch.where(
+                distance == 0,
+                torch.ones_like(distance, dtype=embedding.dtype),
+                torch.where(
+                    distance == 1,
+                    torch.full_like(
+                        distance, 0.1, dtype=embedding.dtype
+                    ),
+                    torch.zeros_like(distance, dtype=embedding.dtype),
                 ),
-                torch.zeros_like(distance, dtype=embedding.dtype),
-            ),
-        )
-        soft_target = soft_target / soft_target.sum(
-            dim=1, keepdim=True
-        )
+            )
+            soft_target = soft_target / soft_target.sum(
+                dim=1, keepdim=True
+            )
         prototype_loss = -(
             soft_target * F.log_softmax(logits, dim=1)
         ).sum(dim=1).mean()
@@ -649,4 +735,21 @@ class PAMFN(nn.Module):
         return (
             prototype_loss
             + self.ordinal_prototype_order_scale * order_loss
+        )
+
+    def _continuous_prototype_targets(self, target, dtype):
+        centers = self.ordinal_grade_centers.to(
+            device=target.device, dtype=target.dtype
+        )
+        right = torch.bucketize(target.detach(), centers)
+        right = right.clamp(1, 3)
+        left = right - 1
+        lower = centers[left]
+        upper = centers[right]
+        fraction = ((target - lower) / (upper - lower)).clamp(0, 1)
+        left_target = F.one_hot(left, num_classes=4).to(dtype)
+        right_target = F.one_hot(right, num_classes=4).to(dtype)
+        return (
+            left_target * (1.0 - fraction).to(dtype).unsqueeze(1)
+            + right_target * fraction.to(dtype).unsqueeze(1)
         )

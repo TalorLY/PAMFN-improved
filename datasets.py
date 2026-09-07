@@ -63,6 +63,33 @@ def get_train_quality_thresholds(dataset_name):
     )
 
 
+def get_train_quality_centers(dataset_name, thresholds=None):
+    """Return the median score in each train-only quality quartile."""
+    values = np.asarray(
+        [label for _, label in read_labels(dataset_name, True)],
+        dtype=np.float64,
+    )
+    thresholds = np.asarray(
+        thresholds or get_train_quality_thresholds(dataset_name),
+        dtype=np.float64,
+    )
+    if (
+            thresholds.shape != (3,)
+            or not np.isfinite(thresholds).all()
+            or not np.all(thresholds[:-1] < thresholds[1:])):
+        raise ValueError("quality thresholds must be finite and increasing")
+    grades = np.digitize(values, thresholds)
+    centers = []
+    for grade in range(4):
+        members = values[grades == grade]
+        if members.size == 0:
+            raise ValueError(f"quality grade {grade + 1} is empty")
+        centers.append(float(np.median(members)))
+    if not np.all(np.diff(centers) > 0):
+        raise ValueError("quality centers must be strictly increasing")
+    return tuple(centers)
+
+
 class AQADataset(Dataset):
     """Official PAMFN train-crop/full-test dataset."""
 

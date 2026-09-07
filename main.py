@@ -1,9 +1,13 @@
 import argparse
+import json
 import math
 import os
 from functools import partial
 
-from datasets import get_train_quality_thresholds
+from datasets import (
+    get_train_quality_centers,
+    get_train_quality_thresholds,
+)
 from pipeline import go, log_info, print_flops, test_model
 
 
@@ -31,6 +35,14 @@ def parser_args():
     parser.add_argument("--ckpt_path", default="")
     parser.add_argument("--save_base_model", default="")
     parser.add_argument("--save_final_model", default="")
+    parser.add_argument(
+        "--result_json", default="",
+        help="optional structured training or evaluation result path",
+    )
+    parser.add_argument(
+        "--run_tag", default="",
+        help="optional experiment method tag stored in result JSON",
+    )
     parser.add_argument(
         "--shared_rank_weight",
         type=float,
@@ -102,6 +114,31 @@ def parser_args():
         type=float,
         default=0.1,
     )
+    parser.add_argument(
+        "--ordinal_prototype_target_mode",
+        choices=("discrete", "continuous"),
+        default="discrete",
+    )
+    parser.add_argument(
+        "--quality_aux_rng_isolated",
+        action="store_true",
+        help="restore global RNG after auxiliary-head initialization",
+    )
+    parser.add_argument(
+        "--coqm_weight", type=float, default=0.0,
+        help="training-only continuous ordered manifold weight",
+    )
+    parser.add_argument("--coqm_dim", type=int, default=128)
+    parser.add_argument(
+        "--coqm_temperature", type=float, default=0.1
+    )
+    parser.add_argument(
+        "--coqm_theta_max", type=float, default=math.pi / 3
+    )
+    parser.add_argument(
+        "--coqm_coord_scale", type=float, default=1.0,
+        help="set to zero for the pre-registered COQM-NoCoord ablation",
+    )
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--print_flops", action="store_true")
     args = parser.parse_args()
@@ -122,11 +159,15 @@ def validate_args(parser, args):
             ("--ordinal_prototype_order_margin",
              args.ordinal_prototype_order_margin),
             ("--ordinal_prototype_order_scale",
-             args.ordinal_prototype_order_scale)):
+             args.ordinal_prototype_order_scale),
+            ("--coqm_weight", args.coqm_weight),
+            ("--coqm_coord_scale", args.coqm_coord_scale)):
         if not math.isfinite(value) or value < 0:
             parser.error(f"{name} must be finite and non-negative")
     if args.ordinal_prototype_dim < 1:
         parser.error("--ordinal_prototype_dim must be positive")
+    if args.coqm_dim < 2:
+        parser.error("--coqm_dim must be at least two")
     if (
             not math.isfinite(args.shared_rank_temperature)
             or args.shared_rank_temperature <= 0):
@@ -145,17 +186,27 @@ def validate_args(parser, args):
         parser.error(
             "--ordinal_prototype_temperature must be finite and positive"
         )
+    if (
+            not math.isfinite(args.coqm_temperature)
+            or args.coqm_temperature <= 0):
+        parser.error("--coqm_temperature must be finite and positive")
+    if (
+            not math.isfinite(args.coqm_theta_max)
+            or args.coqm_theta_max <= 0
+            or args.coqm_theta_max > math.pi / 2):
+        parser.error("--coqm_theta_max must be in (0, pi / 2]")
     active_objectives = sum(
         value > 0
         for value in (
             args.shared_rank_weight,
             args.shared_list_weight,
             args.ordinal_prototype_weight,
+            args.coqm_weight,
         )
     )
     if active_objectives > 1:
         parser.error(
-            "pairwise, List-wise, and prototype supervision are "
+            "pairwise, List-wise, prototype, and COQM supervision are "
             "mutually exclusive"
         )
     if (
@@ -201,6 +252,17 @@ def build_configs(args, config):
         "batch_size": current["batch_size"],
         "num_workers": current["num_workers"],
     }
+    ordinal_thresholds = (
+        get_train_quality_thresholds(args.action)
+        if args.ordinal_prototype_weight > 0 else ()
+    )
+    ordinal_centers = (
+        get_train_quality_centers(args.action, ordinal_thresholds)
+        if (
+            args.ordinal_prototype_weight > 0
+            and args.ordinal_prototype_target_mode == "continuous"
+        ) else ()
+    )
 
     if args.multi_modality:
         model_config = {
@@ -229,8 +291,7 @@ def build_configs(args, config):
                 "ordinal_prototype_weight":
                     args.ordinal_prototype_weight,
                 "ordinal_quality_thresholds": (
-                    get_train_quality_thresholds(args.action)
-                    if args.ordinal_prototype_weight > 0 else ()
+                    ordinal_thresholds
                 ),
                 "ordinal_prototype_dim":
                     args.ordinal_prototype_dim,
@@ -240,6 +301,16 @@ def build_configs(args, config):
                     args.ordinal_prototype_order_margin,
                 "ordinal_prototype_order_scale":
                     args.ordinal_prototype_order_scale,
+                "ordinal_prototype_target_mode":
+                    args.ordinal_prototype_target_mode,
+                "ordinal_grade_centers": ordinal_centers,
+                "quality_aux_rng_isolated":
+                    args.quality_aux_rng_isolated,
+                "coqm_weight": args.coqm_weight,
+                "coqm_dim": args.coqm_dim,
+                "coqm_temperature": args.coqm_temperature,
+                "coqm_theta_max": args.coqm_theta_max,
+                "coqm_coord_scale": args.coqm_coord_scale,
             },
         }
     else:
@@ -308,11 +379,30 @@ def log_configuration(log_func, args, epoch_num):
             f"dim={args.ordinal_prototype_dim}; "
             f"temperature={args.ordinal_prototype_temperature:g}; "
             f"order_margin={args.ordinal_prototype_order_margin:g}; "
-            f"order_scale={args.ordinal_prototype_order_scale:g}"
+            f"order_scale={args.ordinal_prototype_order_scale:g}; "
+            f"target={args.ordinal_prototype_target_mode}; "
+            f"rng_isolated={args.quality_aux_rng_isolated}"
         )
         log_func(
             "Train-only quality quartiles: "
             + ", ".join(f"{value:.6f}" for value in thresholds)
+        )
+        if args.ordinal_prototype_target_mode == "continuous":
+            centers = get_train_quality_centers(
+                args.action, thresholds
+            )
+            log_func(
+                "Train-only grade centers: "
+                + ", ".join(f"{value:.6f}" for value in centers)
+            )
+    elif args.coqm_weight > 0:
+        log_func(
+            "Training objective: official MSE + "
+            f"{args.coqm_weight:g}*COQM; dim={args.coqm_dim}; "
+            f"anchors=4; temperature={args.coqm_temperature:g}; "
+            f"theta_max={args.coqm_theta_max:g}; "
+            f"coord_scale={args.coqm_coord_scale:g}; "
+            "rng_isolated=True"
         )
     else:
         log_func("Training objective: official PAMFN MSE")
@@ -345,13 +435,15 @@ def main():
             current["ckpt_dir"],
             f"{args.action}_multimodal.pth",
         )
-        test_model(
+        result = test_model(
             model_kwargs=model_config,
             dataset_kwargs=dataset_config,
             ckpt_path=checkpoint,
             log_func=log_func,
             seed=args.seed,
         )
+        result["run"] = _run_metadata(args, epoch_num)
+        _write_result_json(args.result_json, result)
         return
 
     results = go(
@@ -367,7 +459,40 @@ def main():
         seed=args.seed,
         clip_grad=current["clip_grad"],
     )
+    _write_result_json(args.result_json, {
+        "best_avg_srcc": results[0] / 100,
+        "best_srcc": results[1] / 100,
+        "min_avg_mse": results[2] / 100,
+        "min_mse": results[3] / 100,
+        "saved_model_srcc": results[4] / 100,
+        "run": _run_metadata(args, epoch_num),
+    })
     print("%.4f\t%.4f\t%.4f\t%.4f" % results[:4])
+
+
+def _write_result_json(path, result):
+    if not path:
+        return
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2, sort_keys=True)
+
+
+def _run_metadata(args, epoch_num):
+    return {
+        "tag": args.run_tag,
+        "action": args.action,
+        "seed": args.seed,
+        "feats": args.feats,
+        "epochs": epoch_num,
+        "ordinal_prototype_weight": args.ordinal_prototype_weight,
+        "ordinal_prototype_target_mode":
+            args.ordinal_prototype_target_mode,
+        "coqm_weight": args.coqm_weight,
+        "coqm_coord_scale": args.coqm_coord_scale,
+        "quality_aux_rng_isolated": args.quality_aux_rng_isolated,
+    }
 
 
 if __name__ == "__main__":

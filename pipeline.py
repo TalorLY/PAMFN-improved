@@ -184,6 +184,9 @@ def test_epoch(model, dataloader):
     losses = AverageMeter()
     predictions = []
     labels = []
+    coqm_curve_cosines = []
+    coqm_probabilities = []
+    coqm_coordinates = []
     start = time.time()
     device = _device_for(model)
     model.eval()
@@ -200,12 +203,81 @@ def test_epoch(model, dataloader):
                 prediction.detach().cpu().reshape(-1).tolist()
             )
             labels.extend(label.detach().cpu().reshape(-1).tolist())
+            coqm_output = other_info.get("coqm_output")
+            if coqm_output is not None:
+                embedding = coqm_output["embedding"]
+                curve_target = model.coqm.manifold_point(
+                    label.reshape(-1).to(dtype=embedding.dtype)
+                )
+                coqm_curve_cosines.extend(
+                    torch.sum(embedding * curve_target, dim=1)
+                    .detach().cpu().tolist()
+                )
+                coqm_probabilities.extend(
+                    coqm_output["probabilities"].detach().cpu().tolist()
+                )
+                coqm_coordinates.extend(
+                    coqm_output["expected_quality"]
+                    .detach().cpu().tolist()
+                )
 
-    return {
+    prediction_array = np.asarray(predictions, dtype=np.float64)
+    label_array = np.asarray(labels, dtype=np.float64)
+    target_std = float(np.std(label_array))
+    result = {
         "time": time.time() - start,
         "loss_x100": losses.avg * 100,
         "coef": _spearman(predictions, labels) * 100,
+        "prediction_std": float(np.std(prediction_array)),
+        "target_std": target_std,
+        "prediction_std_ratio": (
+            float(np.std(prediction_array) / target_std)
+            if target_std > 0 else float("nan")
+        ),
+        "mae": float(np.mean(np.abs(prediction_array - label_array))),
+        "bias": float(np.mean(prediction_array - label_array)),
     }
+    if coqm_coordinates:
+        probabilities = np.asarray(
+            coqm_probabilities, dtype=np.float64
+        )
+        coordinates = np.asarray(coqm_coordinates, dtype=np.float64)
+        hard_counts = np.bincount(
+            probabilities.argmax(axis=1), minlength=probabilities.shape[1]
+        ).astype(np.float64)
+        prototypes = model.coqm.manifold_point(
+            model.coqm.anchor_scores
+        ).detach()
+        u, v = model.coqm.orthogonal_basis()
+        result["coqm"] = {
+            "curve_cosine": float(np.mean(coqm_curve_cosines)),
+            "coordinate_mae": float(
+                np.mean(np.abs(coordinates - label_array))
+            ),
+            "quality_std_ratio": (
+                float(np.std(coordinates) / target_std)
+                if target_std > 0 else float("nan")
+            ),
+            "soft_occupancy": probabilities.mean(axis=0).tolist(),
+            "hard_occupancy": (
+                hard_counts / hard_counts.sum()
+            ).tolist(),
+            "orthogonal_error": float(
+                torch.abs(torch.sum(u * v)).cpu().item()
+            ),
+            "adjacent_cosine_distance": (
+                1.0 - torch.sum(
+                    prototypes[:-1] * prototypes[1:], dim=1
+                )
+            ).cpu().tolist(),
+            "score_q_spearman": _spearman(
+                prediction_array, coordinates
+            ),
+            "score_q_pearson": float(np.corrcoef(
+                prediction_array, coordinates
+            )[0, 1]),
+        }
+    return result
 
 
 def _ensure_parent(path):
@@ -255,7 +327,8 @@ def train_loop(
                 torch.save(model, save_base_model)
                 coefficient_of_saved_model = test_result["coef"]
 
-        if save_final_model and test_result["coef"] > max_coef:
+        if save_final_model and (
+                current_epoch == 0 or test_result["coef"] > max_coef):
             _ensure_parent(save_final_model)
             torch.save(model.state_dict(), save_final_model)
             coefficient_of_saved_model = test_result["coef"]
@@ -372,8 +445,17 @@ def test_model(
     result = test_epoch(model, test_loader)
     log_func(
         f"Coef: {result['coef'] / 100:.4f}\t"
-        f"Loss: {result['loss_x100'] / 100:.6f}"
+        f"Loss: {result['loss_x100'] / 100:.6f}\t"
+        f"PredStd/GTStd: {result['prediction_std_ratio']:.4f}"
     )
+    if "coqm" in result:
+        coqm = result["coqm"]
+        log_func(
+            f"COQM curve cosine: {coqm['curve_cosine']:.4f}\t"
+            f"coord MAE: {coqm['coordinate_mae']:.6f}\t"
+            f"q std/GT std: {coqm['quality_std_ratio']:.4f}\t"
+            f"score/q SRCC: {coqm['score_q_spearman']:.4f}"
+        )
     return result
 
 
