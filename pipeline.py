@@ -1,5 +1,6 @@
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -7,8 +8,11 @@ from scipy.stats import spearmanr
 from torch.utils.data import DataLoader
 
 from datasets import AQADataset
-from utils.lr_scheduler import build_scheduler
+from models.coqm import preserve_torch_rng_state
 from utils.utils import AverageMeter
+
+
+EVAL_POLICIES = ("legacy_gumbel", "argmax", "mc_gumbel")
 
 
 def build_dataset(
@@ -100,6 +104,8 @@ def build_optimizer(
 def build_lr_scheduler(
         optimizer, scheduler, epoch_num, scheduler_steps,
         lr_min=5e-6, warmup_lr_init=5e-6, decay_rate=0.1):
+    from utils.lr_scheduler import build_scheduler
+
     return build_scheduler(
         optimizer,
         scheduler,
@@ -180,7 +186,37 @@ def train_epoch(
     }
 
 
-def test_epoch(model, dataloader):
+def _validate_eval_config(eval_policy, eval_mc_samples):
+    if eval_policy not in EVAL_POLICIES:
+        raise ValueError(
+            "eval_policy must be legacy_gumbel, argmax, or mc_gumbel"
+        )
+    if eval_mc_samples < 1:
+        raise ValueError("eval_mc_samples must be positive")
+    if eval_policy == "mc_gumbel" and eval_mc_samples < 2:
+        raise ValueError(
+            "mc_gumbel requires at least two evaluation samples"
+        )
+
+
+def _seed_torch_for_evaluation(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def test_epoch(
+        model, dataloader, eval_policy="legacy_gumbel",
+        eval_mc_samples=20, eval_seed=20260908):
+    _validate_eval_config(eval_policy, eval_mc_samples)
+    model_eval_policy = getattr(model, "eval_policy", eval_policy)
+    if model_eval_policy != eval_policy:
+        raise ValueError(
+            "model eval_policy does not match the evaluation request: "
+            f"{model_eval_policy} != {eval_policy}"
+        )
+    eval_passes = (
+        eval_mc_samples if eval_policy == "mc_gumbel" else 1
+    )
     losses = AverageMeter()
     predictions = []
     labels = []
@@ -191,41 +227,81 @@ def test_epoch(model, dataloader):
     device = _device_for(model)
     model.eval()
 
-    with torch.no_grad():
-        for batch in dataloader:
-            model_input, label = _prepare_batch(batch, device)
-            prediction, other_info = model(model_input)
-            loss = model.call_loss(
-                prediction, label, **other_info
-            )
-            losses.update(loss.item(), label.shape[0])
-            predictions.extend(
-                prediction.detach().cpu().reshape(-1).tolist()
-            )
-            labels.extend(label.detach().cpu().reshape(-1).tolist())
-            coqm_output = other_info.get("coqm_output")
-            if coqm_output is not None:
-                embedding = coqm_output["embedding"]
-                curve_target = model.coqm.manifold_point(
-                    label.reshape(-1).to(dtype=embedding.dtype)
+    rng_context = (
+        preserve_torch_rng_state()
+        if eval_policy != "legacy_gumbel" else nullcontext()
+    )
+    with rng_context:
+        if eval_policy != "legacy_gumbel":
+            _seed_torch_for_evaluation(eval_seed)
+        with torch.no_grad():
+            for batch in dataloader:
+                model_input, label = _prepare_batch(batch, device)
+                pass_predictions = []
+                pass_coqm_outputs = []
+                for _ in range(eval_passes):
+                    prediction, other_info = model(model_input)
+                    pass_predictions.append(prediction)
+                    coqm_output = other_info.get("coqm_output")
+                    if coqm_output is not None:
+                        pass_coqm_outputs.append(coqm_output)
+
+                prediction = torch.stack(
+                    pass_predictions, dim=0
+                ).mean(dim=0)
+                loss = model.call_loss(prediction, label)
+                losses.update(loss.item(), label.shape[0])
+                predictions.extend(
+                    prediction.detach().cpu().reshape(-1).tolist()
                 )
-                coqm_curve_cosines.extend(
-                    torch.sum(embedding * curve_target, dim=1)
-                    .detach().cpu().tolist()
-                )
-                coqm_probabilities.extend(
-                    coqm_output["probabilities"].detach().cpu().tolist()
-                )
-                coqm_coordinates.extend(
-                    coqm_output["expected_quality"]
-                    .detach().cpu().tolist()
-                )
+                labels.extend(label.detach().cpu().reshape(-1).tolist())
+
+                if pass_coqm_outputs:
+                    if len(pass_coqm_outputs) != eval_passes:
+                        raise RuntimeError(
+                            "COQM output was missing from an evaluation pass"
+                        )
+                    curve_cosines = []
+                    for coqm_output in pass_coqm_outputs:
+                        embedding = coqm_output["embedding"]
+                        curve_target = model.coqm.manifold_point(
+                            label.reshape(-1).to(
+                                dtype=embedding.dtype
+                            )
+                        )
+                        curve_cosines.append(torch.sum(
+                            embedding * curve_target, dim=1
+                        ))
+                    coqm_curve_cosines.extend(
+                        torch.stack(curve_cosines, dim=0)
+                        .mean(dim=0).detach().cpu().tolist()
+                    )
+                    coqm_probabilities.extend(
+                        torch.stack([
+                            output["probabilities"]
+                            for output in pass_coqm_outputs
+                        ], dim=0).mean(dim=0).detach().cpu().tolist()
+                    )
+                    coqm_coordinates.extend(
+                        torch.stack([
+                            output["expected_quality"]
+                            for output in pass_coqm_outputs
+                        ], dim=0).mean(dim=0).detach().cpu().tolist()
+                    )
 
     prediction_array = np.asarray(predictions, dtype=np.float64)
     label_array = np.asarray(labels, dtype=np.float64)
     target_std = float(np.std(label_array))
     result = {
         "time": time.time() - start,
+        "evaluation": {
+            "policy": eval_policy,
+            "passes": eval_passes,
+            "seed": (
+                eval_seed if eval_policy != "legacy_gumbel" else None
+            ),
+            "rng_isolated": eval_policy != "legacy_gumbel",
+        },
         "loss_x100": losses.avg * 100,
         "coef": _spearman(predictions, labels) * 100,
         "prediction_std": float(np.std(prediction_array)),
@@ -289,7 +365,9 @@ def train_loop(
         model, optimizer, lr_scheduler,
         train_dataloader, test_dataloader, epoch_num,
         save_base_model="", save_final_model="", save_moniter="",
-        log_func=None, clip_grad=False):
+        log_func=None, clip_grad=False,
+        eval_policy="legacy_gumbel", eval_mc_samples=20,
+        eval_seed=20260908):
     log_func = log_func or print
     max_coef = 0.0
     max_avg_coef = 0.0
@@ -308,7 +386,13 @@ def train_loop(
             current_epoch,
             clip_grad=clip_grad,
         )
-        test_result = test_epoch(model, test_dataloader)
+        test_result = test_epoch(
+            model,
+            test_dataloader,
+            eval_policy=eval_policy,
+            eval_mc_samples=eval_mc_samples,
+            eval_seed=eval_seed,
+        )
         test_losses.append(test_result["loss_x100"])
         test_coefs.append(test_result["coef"])
         average_loss = np.mean(test_losses[-10:])
@@ -377,7 +461,8 @@ def go(
         model_kwargs, optimizer_kwargs, lr_scheduler_kwargs,
         dataset_kwargs, epoch_num, save_base_model="",
         save_final_model="", save_moniter="", log_func=None,
-        seed=0, clip_grad=False):
+        seed=0, clip_grad=False, eval_policy="legacy_gumbel",
+        eval_mc_samples=20, eval_seed=20260908):
     log_func = log_func or print
     setup_seed(seed)
     train_loader, test_loader = build_dataset(**dataset_kwargs)
@@ -406,6 +491,9 @@ def go(
         save_final_model=save_final_model,
         log_func=log_func,
         clip_grad=clip_grad,
+        eval_policy=eval_policy,
+        eval_mc_samples=eval_mc_samples,
+        eval_seed=eval_seed,
     )
     log_func(
         f"best avg coef: {results[0] / 100:.4f}\t"
@@ -432,7 +520,8 @@ def _load_state_dict(path):
 
 def test_model(
         model_kwargs, dataset_kwargs, ckpt_path="",
-        log_func=None, seed=0):
+        log_func=None, seed=0, eval_policy="legacy_gumbel",
+        eval_mc_samples=20, eval_seed=20260908):
     log_func = log_func or print
     setup_seed(seed)
     _, test_loader = build_dataset(**dataset_kwargs)
@@ -442,7 +531,13 @@ def test_model(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     model.to(device)
-    result = test_epoch(model, test_loader)
+    result = test_epoch(
+        model,
+        test_loader,
+        eval_policy=eval_policy,
+        eval_mc_samples=eval_mc_samples,
+        eval_seed=eval_seed,
+    )
     log_func(
         f"Coef: {result['coef'] / 100:.4f}\t"
         f"Loss: {result['loss_x100'] / 100:.6f}\t"

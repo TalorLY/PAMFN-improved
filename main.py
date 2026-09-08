@@ -32,6 +32,27 @@ def parser_args():
         default="legacy",
         help="official random-crop/full-test sequence behavior",
     )
+    parser.add_argument(
+        "--eval_policy",
+        choices=("legacy_gumbel", "argmax", "mc_gumbel"),
+        default="argmax",
+        help=(
+            "fusion routing used during evaluation; training remains "
+            "stochastic Gumbel"
+        ),
+    )
+    parser.add_argument(
+        "--eval_mc_samples",
+        type=int,
+        default=20,
+        help="number of prediction draws averaged by mc_gumbel",
+    )
+    parser.add_argument(
+        "--eval_seed",
+        type=int,
+        default=20260908,
+        help="fixed isolated RNG seed for non-legacy evaluation",
+    )
     parser.add_argument("--ckpt_path", default="")
     parser.add_argument("--save_base_model", default="")
     parser.add_argument("--save_final_model", default="")
@@ -139,6 +160,15 @@ def parser_args():
         "--coqm_coord_scale", type=float, default=1.0,
         help="set to zero for the pre-registered COQM-NoCoord ablation",
     )
+    parser.add_argument(
+        "--coqm_anchor_mode",
+        choices=("uniform", "train_centers"),
+        default="uniform",
+        help=(
+            "place COQM anchors uniformly or at train-set "
+            "quartile-bin medians"
+        ),
+    )
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--print_flops", action="store_true")
     args = parser.parse_args()
@@ -149,6 +179,14 @@ def parser_args():
 def validate_args(parser, args):
     if args.epochs is not None and args.epochs < 1:
         parser.error("--epochs must be positive")
+    if args.eval_mc_samples < 1:
+        parser.error("--eval_mc_samples must be positive")
+    if args.eval_policy == "mc_gumbel" and args.eval_mc_samples < 2:
+        parser.error("--eval_policy mc_gumbel requires at least 2 samples")
+    if args.eval_policy == "mc_gumbel" and not args.test:
+        parser.error(
+            "--eval_policy mc_gumbel is diagnostic and requires --test"
+        )
     for name, value in (
             ("--shared_rank_weight", args.shared_rank_weight),
             ("--shared_rank_margin", args.shared_rank_margin),
@@ -263,6 +301,13 @@ def build_configs(args, config):
             and args.ordinal_prototype_target_mode == "continuous"
         ) else ()
     )
+    coqm_anchor_scores = (
+        get_train_quality_centers(args.action)
+        if (
+            args.coqm_weight > 0
+            and args.coqm_anchor_mode == "train_centers"
+        ) else ()
+    )
 
     if args.multi_modality:
         model_config = {
@@ -311,6 +356,8 @@ def build_configs(args, config):
                 "coqm_temperature": args.coqm_temperature,
                 "coqm_theta_max": args.coqm_theta_max,
                 "coqm_coord_scale": args.coqm_coord_scale,
+                "coqm_anchor_scores": coqm_anchor_scores,
+                "eval_policy": args.eval_policy,
             },
         }
     else:
@@ -355,7 +402,9 @@ def log_configuration(log_func, args, epoch_num):
     )
     log_func(
         "Evaluation protocol: official full train/test; original legacy "
-        "crop and DataLoader RNG; test every epoch"
+        "crop; test every epoch; "
+        f"routing={args.eval_policy}; mc_samples={args.eval_mc_samples}; "
+        f"eval_seed={args.eval_seed}"
     )
     if args.shared_rank_weight > 0:
         log_func(
@@ -396,13 +445,23 @@ def log_configuration(log_func, args, epoch_num):
                 + ", ".join(f"{value:.6f}" for value in centers)
             )
     elif args.coqm_weight > 0:
+        anchor_scores = (
+            get_train_quality_centers(args.action)
+            if args.coqm_anchor_mode == "train_centers"
+            else (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
+        )
         log_func(
             "Training objective: official MSE + "
             f"{args.coqm_weight:g}*COQM; dim={args.coqm_dim}; "
             f"anchors=4; temperature={args.coqm_temperature:g}; "
             f"theta_max={args.coqm_theta_max:g}; "
             f"coord_scale={args.coqm_coord_scale:g}; "
+            f"anchor_mode={args.coqm_anchor_mode}; "
             "rng_isolated=True"
+        )
+        log_func(
+            "COQM anchor scores: "
+            + ", ".join(f"{value:.6f}" for value in anchor_scores)
         )
     else:
         log_func("Training objective: official PAMFN MSE")
@@ -441,6 +500,9 @@ def main():
             ckpt_path=checkpoint,
             log_func=log_func,
             seed=args.seed,
+            eval_policy=args.eval_policy,
+            eval_mc_samples=args.eval_mc_samples,
+            eval_seed=args.eval_seed,
         )
         result["run"] = _run_metadata(args, epoch_num)
         _write_result_json(args.result_json, result)
@@ -458,6 +520,9 @@ def main():
         log_func=log_func,
         seed=args.seed,
         clip_grad=current["clip_grad"],
+        eval_policy=args.eval_policy,
+        eval_mc_samples=args.eval_mc_samples,
+        eval_seed=args.eval_seed,
     )
     _write_result_json(args.result_json, {
         "best_avg_srcc": results[0] / 100,
@@ -491,7 +556,21 @@ def _run_metadata(args, epoch_num):
             args.ordinal_prototype_target_mode,
         "coqm_weight": args.coqm_weight,
         "coqm_coord_scale": args.coqm_coord_scale,
+        "coqm_anchor_mode": args.coqm_anchor_mode,
+        "coqm_anchor_scores": (
+            list(get_train_quality_centers(args.action))
+            if (
+                args.coqm_weight > 0
+                and args.coqm_anchor_mode == "train_centers"
+            ) else (
+                [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]
+                if args.coqm_weight > 0 else []
+            )
+        ),
         "quality_aux_rng_isolated": args.quality_aux_rng_isolated,
+        "eval_policy": args.eval_policy,
+        "eval_mc_samples": args.eval_mc_samples,
+        "eval_seed": args.eval_seed,
     }
 
 

@@ -28,7 +28,8 @@ class ContinuousOrderedQualityManifold(nn.Module):
 
     def __init__(
             self, input_dim, embedding_dim=128, num_anchors=4,
-            temperature=0.1, theta_max=math.pi / 3):
+            temperature=0.1, theta_max=math.pi / 3,
+            anchor_scores=None):
         super().__init__()
         if input_dim < 1:
             raise ValueError("input_dim must be positive")
@@ -60,9 +61,33 @@ class ContinuousOrderedQualityManifold(nn.Module):
         self.temperature = float(temperature)
         self.theta_max = float(theta_max)
         self.num_anchors = int(num_anchors)
+        if anchor_scores is None:
+            anchor_scores = torch.linspace(
+                0.0, 1.0, self.num_anchors
+            )
+        else:
+            anchor_scores = torch.as_tensor(
+                anchor_scores, dtype=torch.float32
+            ).reshape(-1)
+            if anchor_scores.numel() != self.num_anchors:
+                raise ValueError(
+                    "anchor_scores must match num_anchors"
+                )
+            if not bool(torch.isfinite(anchor_scores).all()):
+                raise ValueError("anchor_scores must be finite")
+            if not bool(
+                    torch.all(anchor_scores[1:] > anchor_scores[:-1])):
+                raise ValueError(
+                    "anchor_scores must be strictly increasing"
+                )
+            if float(anchor_scores[0]) < 0.0 or (
+                    float(anchor_scores[-1]) > 1.0):
+                raise ValueError(
+                    "anchor_scores must lie in [0, 1]"
+                )
         self.register_buffer(
             "anchor_scores",
-            torch.linspace(0.0, 1.0, self.num_anchors),
+            anchor_scores.clone().detach(),
         )
 
     def orthogonal_basis(self):

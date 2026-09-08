@@ -175,9 +175,17 @@ class MSFusion(nn.Module):
 
 class CMFusion(nn.Module):
     def __init__(self, dim, kind_count, num_heads=1,
-                 gap=False, dropout=0.1):
+                 gap=False, dropout=0.1,
+                 eval_policy="legacy_gumbel"):
         super().__init__()
+        if eval_policy not in (
+                "legacy_gumbel", "argmax", "mc_gumbel"):
+            raise ValueError(
+                "eval_policy must be legacy_gumbel, argmax, or "
+                "mc_gumbel"
+            )
         self.K = kind_count
+        self.eval_policy = str(eval_policy)
         self.proj1 = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(dim, dim, 1),
@@ -228,9 +236,14 @@ class CMFusion(nn.Module):
 
     def gen_fusion_kind(self, feats, tau):
         logit = self.pool(self.policy(torch.cat(feats, dim=1)))
-        fusion_kind = F.gumbel_softmax(
-            logit, tau, hard=True, dim=1
-        )
+        if self.training or self.eval_policy != "argmax":
+            fusion_kind = F.gumbel_softmax(
+                logit, tau, hard=True, dim=1
+            )
+        else:
+            index = logit.argmax(dim=1, keepdim=True)
+            fusion_kind = torch.zeros_like(logit)
+            fusion_kind.scatter_(1, index, 1.0)
         return fusion_kind, self.gen_mask(fusion_kind)
 
     def forward(self, feats, combined_feat, single_fused, tau):
@@ -278,7 +291,9 @@ class CMFusion(nn.Module):
 
 
 class FusionBlock(nn.Module):
-    def __init__(self, dim, kind_count, ms_heads, cm_heads, gap=False):
+    def __init__(
+            self, dim, kind_count, ms_heads, cm_heads, gap=False,
+            eval_policy="legacy_gumbel"):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(dim * 3, dim, 3, 1, 1),
@@ -295,7 +310,8 @@ class FusionBlock(nn.Module):
         )
         self.s_fusion = MSFusion(dim, ms_heads)
         self.f_fusion = CMFusion(
-            dim, kind_count, cm_heads, gap
+            dim, kind_count, cm_heads, gap,
+            eval_policy=eval_policy,
         )
 
     def forward(self, combined, feats, single_feats, tau):
@@ -330,7 +346,8 @@ class PAMFN(nn.Module):
             quality_aux_rng_isolated=False,
             coqm_weight=0.0, coqm_dim=128,
             coqm_temperature=0.1, coqm_theta_max=np.pi / 3,
-            coqm_coord_scale=1.0):
+            coqm_coord_scale=1.0, coqm_anchor_scores=(),
+            eval_policy="legacy_gumbel"):
         super().__init__()
         for name, value in (
                 ("shared_rank_weight", shared_rank_weight),
@@ -381,6 +398,29 @@ class PAMFN(nn.Module):
                 or coqm_theta_max <= 0
                 or coqm_theta_max > np.pi / 2):
             raise ValueError("coqm_theta_max must be in (0, pi / 2]")
+        coqm_anchor_scores = np.asarray(
+            coqm_anchor_scores, dtype=np.float64
+        )
+        if coqm_weight > 0 and coqm_anchor_scores.size:
+            if (
+                    coqm_anchor_scores.shape != (4,)
+                    or not np.isfinite(coqm_anchor_scores).all()
+                    or not np.all(
+                        coqm_anchor_scores[:-1]
+                        < coqm_anchor_scores[1:]
+                    )
+                    or coqm_anchor_scores[0] < 0
+                    or coqm_anchor_scores[-1] > 1):
+                raise ValueError(
+                    "coqm_anchor_scores must contain four finite "
+                    "increasing values in [0, 1]"
+                )
+        if eval_policy not in (
+                "legacy_gumbel", "argmax", "mc_gumbel"):
+            raise ValueError(
+                "eval_policy must be legacy_gumbel, argmax, or "
+                "mc_gumbel"
+            )
         active_objectives = sum(
             value > 0
             for value in (
@@ -450,6 +490,7 @@ class PAMFN(nn.Module):
         )
         self.coqm_weight = float(coqm_weight)
         self.coqm_coord_scale = float(coqm_coord_scale)
+        self.eval_policy = str(eval_policy)
         self.model_r = _torch_load(osp.join(
             ckpt_dir,
             f"{dataset_name}_rgb_{rgb_ckpt_name}.pth",
@@ -467,13 +508,16 @@ class PAMFN(nn.Module):
             torch.zeros(model_dim * 3), requires_grad=False
         )
         self.stage1 = FusionBlock(
-            model_dim, K, ms_heads, cm_heads
+            model_dim, K, ms_heads, cm_heads,
+            eval_policy=self.eval_policy,
         )
         self.stage2 = FusionBlock(
-            model_dim, K, ms_heads, cm_heads
+            model_dim, K, ms_heads, cm_heads,
+            eval_policy=self.eval_policy,
         )
         self.stage3 = FusionBlock(
-            model_dim, K, ms_heads, cm_heads, True
+            model_dim, K, ms_heads, cm_heads, True,
+            eval_policy=self.eval_policy,
         )
         self.pool = nn.AvgPool1d(2, 2)
         self.gap = nn.AdaptiveAvgPool1d(1)
@@ -527,6 +571,10 @@ class PAMFN(nn.Module):
                 num_anchors=4,
                 temperature=coqm_temperature,
                 theta_max=coqm_theta_max,
+                anchor_scores=(
+                    coqm_anchor_scores
+                    if coqm_anchor_scores.size else None
+                ),
             )
 
     def forward(self, input_feats):
