@@ -170,6 +170,17 @@ def parser_args():
         ),
     )
     parser.add_argument("--test", action="store_true")
+    parser.add_argument('--qmd_mode', choices=('off', 'mask_gt', 'score_qmd', 'score_rank_qmd', 'reliable_score_qmd'), default='off')
+    parser.add_argument('--qmd_weight', type=float, default=1.0)
+    parser.add_argument('--qmd_mask_ratio', type=float, default=0.15)
+    parser.add_argument('--qmd_gt_weight', type=float, default=0.5)
+    parser.add_argument('--qmd_target_ratio', type=float, default=0.075)
+    parser.add_argument('--qmd_beta_cap', type=float, default=1.0)
+    parser.add_argument('--qmd_warmup', type=float, default=0.1)
+    parser.add_argument('--qmd_rampup', type=float, default=0.1)
+    parser.add_argument('--qmd_rank_weight', type=float, default=0.5)
+    parser.add_argument('--qmd_rank_gap', type=float, default=0.05)
+    parser.add_argument('--qmd_rank_gamma', type=float, default=0.1)
     parser.add_argument("--print_flops", action="store_true")
     args = parser.parse_args()
     validate_args(parser, args)
@@ -177,6 +188,22 @@ def parser_args():
 
 
 def validate_args(parser, args):
+    for key in ('qmd_weight', 'qmd_gt_weight', 'qmd_target_ratio', 'qmd_beta_cap',
+                'qmd_warmup', 'qmd_rampup', 'qmd_rank_weight', 'qmd_rank_gap', 'qmd_rank_gamma'):
+        value = getattr(args, key)
+        if not math.isfinite(value) or value < 0:
+            parser.error('--' + key + ' must be finite and nonnegative')
+    if not 0 < args.qmd_mask_ratio < 1 or args.qmd_warmup + args.qmd_rampup > 1:
+        parser.error('invalid QMD mask ratio or warmup/rampup')
+    if args.qmd_rank_gamma <= 0:
+        parser.error('--qmd_rank_gamma must be positive')
+    if args.qmd_mode != 'off' and args.qmd_weight > 0:
+        if not args.multi_modality:
+            parser.error('QMD requires --multi_modality')
+        if any(x > 0 for x in (args.coqm_weight, args.shared_rank_weight, args.shared_list_weight)):
+            parser.error('QMD only supports the Ordered auxiliary combination')
+        if args.ordinal_prototype_weight > 0 and not args.quality_aux_rng_isolated:
+            parser.error('QMD + Ordered requires --quality_aux_rng_isolated')
     if args.epochs is not None and args.epochs < 1:
         parser.error("--epochs must be positive")
     if args.eval_mc_samples < 1:
@@ -290,6 +317,8 @@ def build_configs(args, config):
         "batch_size": current["batch_size"],
         "num_workers": current["num_workers"],
     }
+    if args.qmd_mode != 'off' and args.qmd_weight > 0 and not args.test:
+        dataset_config['return_valid_lengths'] = True
     ordinal_thresholds = (
         get_train_quality_thresholds(args.action)
         if args.ordinal_prototype_weight > 0 else ()
@@ -396,6 +425,11 @@ def build_configs(args, config):
 
 
 def log_configuration(log_func, args, epoch_num):
+    if args.qmd_mode == 'reliable_score_qmd':
+        log_func('Reliable Score-KD: distill only if abs(full-y) < abs(masked-y); '
+                 'training labels only; ungated beta calibration; no Rank-KD')
+    if args.qmd_mode != 'off':
+        log_func('QMD config: ' + json.dumps(qmd_config(args), sort_keys=True))
     log_func(
         f"Run: action={args.action} feats={args.feats} "
         f"seed={args.seed} epochs={epoch_num}"
@@ -444,6 +478,9 @@ def log_configuration(log_func, args, epoch_num):
                 "Train-only grade centers: "
                 + ", ".join(f"{value:.6f}" for value in centers)
             )
+        if args.qmd_mode != 'off' and args.qmd_weight > 0:
+            log_func('Additional training objective: scheduled Mask-GT + Score-KD'
+                     + (' + reliability-gated Rank-KD' if args.qmd_mode == 'score_rank_qmd' else ''))
     elif args.coqm_weight > 0:
         anchor_scores = (
             get_train_quality_centers(args.action)
@@ -464,13 +501,23 @@ def log_configuration(log_func, args, epoch_num):
             + ", ".join(f"{value:.6f}" for value in anchor_scores)
         )
     else:
-        log_func("Training objective: official PAMFN MSE")
+        if args.qmd_mode != 'off' and args.qmd_weight > 0:
+            log_func('Training objective: full-view MSE + scheduled Mask-GT'
+                     + (' + calibrated Score-KD' if args.qmd_mode in ('score_qmd', 'score_rank_qmd', 'reliable_score_qmd') else '')
+                     + (' + reliability-gated Rank-KD' if args.qmd_mode == 'score_rank_qmd' else '')
+                     + (' + full-view Ordered' if args.ordinal_prototype_weight > 0 else ''))
+        else:
+            log_func("Training objective: official PAMFN MSE")
 
 
 def main():
     args = parser_args()
     if args.gpu != "-1":
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+        if args.qmd_mode != 'off':
+            import torch
+            if not torch.cuda.is_available():
+                raise RuntimeError('QMD requested GPU is unavailable; check GPU index/environment')
     config = load_config(args.action, args.feats)
     (
         current,
@@ -523,6 +570,9 @@ def main():
         eval_policy=args.eval_policy,
         eval_mc_samples=args.eval_mc_samples,
         eval_seed=args.eval_seed,
+        qmd_config=(qmd_config(args) if args.qmd_mode != 'off' and args.qmd_weight > 0 else None),
+        qmd_report_path=(os.path.join(os.path.dirname(args.result_json), 'qmd_training.json')
+                         if args.result_json else ''),
     )
     _write_result_json(args.result_json, {
         "best_avg_srcc": results[0] / 100,
@@ -571,7 +621,24 @@ def _run_metadata(args, epoch_num):
         "eval_policy": args.eval_policy,
         "eval_mc_samples": args.eval_mc_samples,
         "eval_seed": args.eval_seed,
+        "qmd": qmd_config(args),
+        "ordered_config": (dict(dim=args.ordinal_prototype_dim,
+                                 temperature=args.ordinal_prototype_temperature,
+                                 margin=args.ordinal_prototype_order_margin,
+                                 order_scale=args.ordinal_prototype_order_scale)
+                           if args.ordinal_prototype_weight > 0 else None),
     }
+
+
+def qmd_config(args):
+    config = dict(mode=args.qmd_mode, weight=args.qmd_weight,
+                mask_ratio=args.qmd_mask_ratio, mask_gt_weight=args.qmd_gt_weight,
+                target_ratio=args.qmd_target_ratio, beta_cap=args.qmd_beta_cap,
+                warmup=args.qmd_warmup, rampup=args.qmd_rampup)
+    if args.qmd_mode == 'score_rank_qmd':
+        config.update(rank_weight=args.qmd_rank_weight, rank_gap=args.qmd_rank_gap,
+                      rank_gamma=args.qmd_rank_gamma)
+    return config
 
 
 if __name__ == "__main__":
