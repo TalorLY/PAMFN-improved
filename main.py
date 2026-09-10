@@ -1,4 +1,5 @@
 import argparse
+import json
 import math
 import os
 from functools import partial
@@ -103,6 +104,20 @@ def parser_args():
         default=0.1,
     )
     parser.add_argument("--test", action="store_true")
+    parser.add_argument('--qmd_mode', choices=('off', 'mask_gt', 'score_qmd', 'score_rank_qmd'), default='off')
+    parser.add_argument('--qmd_weight', type=float, default=1.0)
+    parser.add_argument('--qmd_mask_ratio', type=float, default=0.15)
+    parser.add_argument('--qmd_gt_weight', type=float, default=0.5)
+    parser.add_argument('--qmd_target_ratio', type=float, default=0.075)
+    parser.add_argument('--qmd_beta_cap', type=float, default=1.0)
+    parser.add_argument('--qmd_warmup', type=float, default=0.1)
+    parser.add_argument('--qmd_rampup', type=float, default=0.1)
+    parser.add_argument('--qmd_rank_weight', type=float, default=0.5)
+    parser.add_argument('--qmd_rank_gap', type=float, default=0.05)
+    parser.add_argument('--qmd_rank_gamma', type=float, default=0.1)
+    parser.add_argument('--result_json', default='')
+    parser.add_argument('--run_tag', default='')
+    parser.add_argument('--replay_rng_path', default='')
     parser.add_argument("--print_flops", action="store_true")
     args = parser.parse_args()
     validate_args(parser, args)
@@ -110,6 +125,18 @@ def parser_args():
 
 
 def validate_args(parser, args):
+    for key in ('qmd_weight', 'qmd_gt_weight', 'qmd_target_ratio', 'qmd_beta_cap',
+                'qmd_warmup', 'qmd_rampup', 'qmd_rank_weight', 'qmd_rank_gap', 'qmd_rank_gamma'):
+        value = getattr(args, key)
+        if not math.isfinite(value) or value < 0:
+            parser.error('--' + key + ' must be finite and nonnegative')
+    if not 0 < args.qmd_mask_ratio < 1 or args.qmd_warmup + args.qmd_rampup > 1:
+        parser.error('invalid QMD mask ratio or warmup/rampup')
+    if args.qmd_rank_gamma <= 0:
+        parser.error('--qmd_rank_gamma must be positive')
+    if args.qmd_mode != 'off' and (not args.multi_modality or args.shared_rank_weight or args.shared_list_weight):
+        parser.error('July28 QMD requires multimodal Base or Ordered')
+
     if args.epochs is not None and args.epochs < 1:
         parser.error("--epochs must be positive")
     for name, value in (
@@ -201,6 +228,9 @@ def build_configs(args, config):
         "batch_size": current["batch_size"],
         "num_workers": current["num_workers"],
     }
+
+    if args.qmd_mode != 'off' and args.qmd_weight > 0 and not args.test:
+        dataset_config['return_valid_lengths'] = True
 
     if args.multi_modality:
         model_config = {
@@ -322,6 +352,9 @@ def main():
     args = parser_args()
     if args.gpu != "-1":
         os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("requested GPU unavailable")
     config = load_config(args.action, args.feats)
     (
         current,
@@ -345,13 +378,16 @@ def main():
             current["ckpt_dir"],
             f"{args.action}_multimodal.pth",
         )
-        test_model(
+        result = test_model(
             model_kwargs=model_config,
             dataset_kwargs=dataset_config,
             ckpt_path=checkpoint,
             log_func=log_func,
             seed=args.seed,
+            replay_rng_path=args.replay_rng_path,
         )
+        result['run'] = run_metadata(args, epoch_num)
+        write_json(args.result_json, result)
         return
 
     results = go(
@@ -366,8 +402,41 @@ def main():
         log_func=log_func,
         seed=args.seed,
         clip_grad=current["clip_grad"],
+        qmd_config=(qmd_config(args) if args.qmd_mode != 'off' and args.qmd_weight > 0 else None),
+        qmd_report_path=(os.path.join(os.path.dirname(args.result_json), 'qmd_training.json')
+                         if args.result_json else ''),
     )
+    write_json(args.result_json, dict(
+        best_avg_srcc=results[0]/100, best_srcc=results[1]/100,
+        min_avg_mse=results[2]/100, min_mse=results[3]/100,
+        saved_model_srcc=results[4]/100, run=run_metadata(args, epoch_num)))
     print("%.4f\t%.4f\t%.4f\t%.4f" % results[:4])
+
+
+def write_json(path, value):
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+
+
+def run_metadata(args, epochs):
+    return dict(action=args.action, seed=args.seed, feats=args.feats, epochs=epochs,
+                tag=args.run_tag, qmd=qmd_config(args), eval_policy='legacy_gumbel',
+                historical_commit='53716f61c117376154c9335b1a689bc667404ce2',
+                ordinal_prototype_weight=args.ordinal_prototype_weight,
+                ordinal_prototype_target_mode='discrete', quality_aux_rng_isolated=False)
+
+
+def qmd_config(args):
+    config = dict(mode=args.qmd_mode, weight=args.qmd_weight,
+                mask_ratio=args.qmd_mask_ratio, mask_gt_weight=args.qmd_gt_weight,
+                target_ratio=args.qmd_target_ratio, beta_cap=args.qmd_beta_cap,
+                warmup=args.qmd_warmup, rampup=args.qmd_rampup)
+    if args.qmd_mode == 'score_rank_qmd':
+        config.update(rank_weight=args.qmd_rank_weight, rank_gap=args.qmd_rank_gap,
+                      rank_gamma=args.qmd_rank_gamma)
+    return config
 
 
 if __name__ == "__main__":

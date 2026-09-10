@@ -70,10 +70,11 @@ class AQADataset(Dataset):
             self, dataset_name, feat_dir,
             rgb_feat, flow_feat, audio_feat,
             squeeze_rgb_feat=None, squeeze_flow_feat=None,
-            is_train=True, segments=-1, **kwargs):
+            is_train=True, segments=-1, return_valid_lengths=False, **kwargs):
         super().__init__()
         del kwargs
         self.is_train = is_train
+        self.return_valid_lengths = return_valid_lengths
         self.squeeze_rgb_feat = squeeze_rgb_feat
         self.squeeze_flow_feat = squeeze_flow_feat
         self.labels = read_labels(dataset_name, is_train)
@@ -142,12 +143,15 @@ class AQADataset(Dataset):
             rgb_data, flow_data, audio_data
         )
 
+        valid_lengths = {'V': len(rgb_data), 'F': len(flow_data), 'A': len(audio_data)}
         if self.is_train:
             if len(rgb_data) > self.segments:
                 start_index = np.random.randint(
                     len(rgb_data) - self.segments
                 )
                 stop_index = start_index + self.segments
+                valid_lengths = {key: max(0, min(n, stop_index) - start_index)
+                                 for key, n in valid_lengths.items()}
                 rgb_data = rgb_data[start_index:stop_index]
                 audio_data = audio_data[start_index:stop_index]
                 flow_data = flow_data[start_index:stop_index]
@@ -161,7 +165,8 @@ class AQADataset(Dataset):
                 flow_data = zero_padding_torch(
                     flow_data, self.segments
                 )
-        return rgb_data, audio_data, flow_data, label, 0
+        return rgb_data, audio_data, flow_data, label, (
+            valid_lengths if self.return_valid_lengths else 0)
 
     def __len__(self):
         return len(self.labels)

@@ -1,5 +1,7 @@
 import os
 import time
+import json
+from models.score_qmd import ScoreQMD, rng_state, set_rng_state
 
 import numpy as np
 import torch
@@ -13,7 +15,7 @@ from utils.utils import AverageMeter
 
 def build_dataset(
         dataset_name, feat_dir, rgb_feat, flow_feat, audio_feat,
-        batch_size=32, num_workers=2, segments=-1):
+        batch_size=32, num_workers=2, segments=-1, return_valid_lengths=False):
     """Build the official full train/test loaders without split overrides."""
     train_dataset = AQADataset(
         dataset_name=dataset_name,
@@ -24,6 +26,7 @@ def build_dataset(
         squeeze_rgb_feat="mean",
         segments=segments,
         is_train=True,
+        return_valid_lengths=return_valid_lengths,
         sequence_sampling="legacy",
     )
     test_dataset = AQADataset(
@@ -133,7 +136,7 @@ def _spearman(predictions, labels):
 
 def train_epoch(
         model, optimizer, lr_scheduler, dataloader,
-        current_epoch, clip_grad=False):
+        current_epoch, clip_grad=False, qmd=None):
     objective_losses = AverageMeter()
     mse_losses = AverageMeter()
     predictions = []
@@ -141,9 +144,12 @@ def train_epoch(
     start = time.time()
     device = _device_for(model)
     model.train()
+    qmd_rows = []
 
     for batch in dataloader:
         model_input, label = _prepare_batch(batch, device)
+        qmd_active = qmd is not None and qmd.scale(current_epoch) > 0
+        before_full = rng_state() if qmd_active else None
         prediction, other_info = model(model_input)
         training_loss = getattr(
             model, "call_training_loss", model.call_loss
@@ -154,6 +160,14 @@ def train_epoch(
         mse = torch.mean(
             (prediction.reshape(-1) - label.reshape(-1)) ** 2
         )
+        if qmd_active:
+            auxiliary, diagnostic = qmd.auxiliary(
+                model, model_input, batch[4], label, prediction, mse,
+                before_full, current_epoch)
+            objective = objective + auxiliary
+            qmd_rows.append(diagnostic)
+        if not bool(torch.isfinite(objective)):
+            raise FloatingPointError('non-finite training objective')
 
         optimizer.zero_grad()
         objective.backward()
@@ -171,6 +185,20 @@ def train_epoch(
 
     if lr_scheduler is not None:
         lr_scheduler.step(current_epoch + 1)
+    if qmd is not None:
+        qmd.epoch_rows.append({
+            'epoch': current_epoch + 1, 'active_batches': len(qmd_rows),
+            'mask_gt': float(np.mean([r['mask_gt'] for r in qmd_rows])) if qmd_rows else 0.0,
+            'score_kd': float(np.mean([r['score_kd'] for r in qmd_rows])) if qmd_rows else 0.0,
+            'beta': qmd.beta, 'scale': qmd.scale(current_epoch),
+        })
+        if qmd.mode == 'score_rank_qmd':
+            qmd.epoch_rows[-1].update(
+                rank_kd=float(np.mean([r.get('rank_kd', 0.) for r in qmd_rows])) if qmd_rows else 0.,
+                eligible_pairs=sum(r.get('eligible_pairs', 0) for r in qmd_rows),
+                total_pairs=sum(r.get('total_pairs', 0) for r in qmd_rows),
+                mean_reliability=float(np.mean([r.get('mean_reliability', 0.) for r in qmd_rows]))
+                                 if qmd_rows else 0.)
     return {
         "time": time.time() - start,
         "mse_x100": mse_losses.avg * 100,
@@ -201,7 +229,12 @@ def test_epoch(model, dataloader):
             )
             labels.extend(label.detach().cpu().reshape(-1).tolist())
 
+    values = np.asarray(predictions, dtype=np.float64)
+    targets = np.asarray(labels, dtype=np.float64)
     return {
+        "prediction_std": float(values.std()),
+        "saturation_fraction": float(np.mean((values < .001) | (values > .999))),
+        "prediction_std_ratio": float(values.std() / targets.std()),
         "time": time.time() - start,
         "loss_x100": losses.avg * 100,
         "coef": _spearman(predictions, labels) * 100,
@@ -217,7 +250,7 @@ def train_loop(
         model, optimizer, lr_scheduler,
         train_dataloader, test_dataloader, epoch_num,
         save_base_model="", save_final_model="", save_moniter="",
-        log_func=None, clip_grad=False):
+        log_func=None, clip_grad=False, qmd=None):
     log_func = log_func or print
     max_coef = 0.0
     max_avg_coef = 0.0
@@ -235,8 +268,16 @@ def train_loop(
             train_dataloader,
             current_epoch,
             clip_grad=clip_grad,
+            qmd=qmd,
         )
+        before_eval = (rng_state(), np.random.get_state()) if save_final_model else None
         test_result = test_epoch(model, test_dataloader)
+        if qmd is not None:
+            log_func('QMD ' + json.dumps(qmd.epoch_rows[-1], sort_keys=True))
+        if save_final_model:
+            _ensure_parent(save_final_model)
+            with open(save_final_model + '.epochs.jsonl', 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(dict(epoch=current_epoch + 1, **test_result), sort_keys=True) + '\n')
         test_losses.append(test_result["loss_x100"])
         test_coefs.append(test_result["coef"])
         average_loss = np.mean(test_losses[-10:])
@@ -258,6 +299,10 @@ def train_loop(
         if save_final_model and test_result["coef"] > max_coef:
             _ensure_parent(save_final_model)
             torch.save(model.state_dict(), save_final_model)
+            # Capture the original stochastic test draw, not a new random replay.
+            torch.save(before_eval, save_final_model + '.eval_rng.pt')
+            with open(save_final_model + '.selection.json', 'w', encoding='utf-8') as handle:
+                json.dump(dict(epoch=current_epoch + 1, **test_result), handle, indent=2, sort_keys=True)
             coefficient_of_saved_model = test_result["coef"]
 
         max_coef = max(max_coef, test_result["coef"])
@@ -304,7 +349,7 @@ def go(
         model_kwargs, optimizer_kwargs, lr_scheduler_kwargs,
         dataset_kwargs, epoch_num, save_base_model="",
         save_final_model="", save_moniter="", log_func=None,
-        seed=0, clip_grad=False):
+        seed=0, clip_grad=False, qmd_config=None, qmd_report_path=""):
     log_func = log_func or print
     setup_seed(seed)
     train_loader, test_loader = build_dataset(**dataset_kwargs)
@@ -321,6 +366,7 @@ def go(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     model.to(device)
+    qmd = ScoreQMD(seed=seed, epochs=epoch_num, **qmd_config) if qmd_config else None
     results = train_loop(
         model,
         optimizer,
@@ -333,7 +379,12 @@ def go(
         save_final_model=save_final_model,
         log_func=log_func,
         clip_grad=clip_grad,
+        qmd=qmd,
     )
+    if qmd is not None and qmd_report_path:
+        _ensure_parent(qmd_report_path)
+        with open(qmd_report_path, 'w', encoding='utf-8') as handle:
+            json.dump(qmd.summary(), handle, indent=2, sort_keys=True)
     log_func(
         f"best avg coef: {results[0] / 100:.4f}\t"
         f"best coef: {results[1] / 100:.4f}\t"
@@ -359,7 +410,7 @@ def _load_state_dict(path):
 
 def test_model(
         model_kwargs, dataset_kwargs, ckpt_path="",
-        log_func=None, seed=0):
+        log_func=None, seed=0, replay_rng_path=""):
     log_func = log_func or print
     setup_seed(seed)
     _, test_loader = build_dataset(**dataset_kwargs)
@@ -369,7 +420,12 @@ def test_model(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
     model.to(device)
+    if replay_rng_path:
+        saved_rng = _load_state_dict(replay_rng_path)
+        set_rng_state(saved_rng[0])
+        np.random.set_state(saved_rng[1])
     result = test_epoch(model, test_loader)
+    result['evaluation'] = dict(policy='legacy_gumbel', replayed_rng=bool(replay_rng_path))
     log_func(
         f"Coef: {result['coef'] / 100:.4f}\t"
         f"Loss: {result['loss_x100'] / 100:.6f}"
