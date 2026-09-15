@@ -62,11 +62,21 @@ def command(argv, cwd, log):
         handle.write('\nCOMMAND ' + json.dumps(argv) + '\n')
         handle.flush()
         env = dict(os.environ, PYTHONPATH=str(cwd), PYTHONUNBUFFERED='1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
-        subprocess.run(argv, cwd=str(cwd), env=env, stdout=handle, stderr=subprocess.STDOUT, check=True)
+        from tools.qmd_process import identity
+        process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=handle, stderr=subprocess.STDOUT)
+        record = dict(identity=identity(process.pid), pid=process.pid, argv=argv,
+                      log=Path(log).name, started_at=time.time(), state='running')
+        process_path = Path(log).parent/(Path(log).stem + '.process.json')
+        save(process_path, record)
+        code = process.wait()
+        record.update(state='finished' if code == 0 else 'failed', returncode=code, ended_at=time.time())
+        save(process_path, record)
+        if code:
+            raise subprocess.CalledProcessError(code, argv)
 
 
 def mode_for(method):
-    if method == 'ordered':
+    if method in ('base', 'ordered'):
         return 'off'
     if 'reliable' in method:
         return 'reliable_score_qmd'
@@ -115,10 +125,10 @@ def cell_path(root, cell):
     return root / protocol / action / ('seed' + str(seed)) / method
 
 
-def validate_cell(out, cell, smoke=False):
+def validate_cell(out, cell, smoke=False, epochs_override=None, calibration_validator=None):
     protocol, action, seed, method = cell
     train, test = read(out/'train_result.json'), read(out/'test_result.json')
-    epochs = 1 if smoke else BUDGET[action]
+    epochs = epochs_override if epochs_override is not None else (1 if smoke else BUDGET[action])
     for data in (train, test):
         run = data['run']
         expected = dict(action=action, seed=seed, tag=method, epochs=epochs, feats=2,
@@ -160,11 +170,15 @@ def validate_cell(out, cell, smoke=False):
             raise ValueError('QMD did not complete the requested training')
         active = qmd['active_batches']
         calibration = qmd['calibration']
-        beta = calibration['beta']
-        if not math.isfinite(beta) or not 0 <= beta <= 1:
-            raise ValueError('invalid beta')
-        if calibration['degenerate'] or beta == 0:
-            flags.append('degenerate_score_calibration')
+        if calibration_validator is not None:
+            beta, calibration_flags = calibration_validator(qmd)
+            flags.extend(calibration_flags)
+        else:
+            beta = calibration['beta']
+            if not math.isfinite(beta) or not 0 <= beta <= 1:
+                raise ValueError('invalid beta')
+            if calibration['degenerate'] or beta == 0:
+                flags.append('degenerate_score_calibration')
         if mode_for(method) == 'reliable_score_qmd':
             gate = qmd['score_gate']
             accepted, total = gate['accepted_samples'], gate['total_samples']
@@ -182,14 +196,16 @@ def validate_cell(out, cell, smoke=False):
                 warnings=flags)
 
 
-def run_cell(root, repositories, cell, gpu, smoke):
+def run_cell(root, repositories, cell, gpu, smoke, argv=None, validator=None,
+             post_test=None, extra_checkpoints=(), extra_required=()):
     out = cell_path(root, cell)
     out.mkdir(parents=True, exist_ok=True)
     protocol, action, seed, method = cell
-    argv = cell_args(protocol, action, seed, method, gpu, smoke)
+    argv = cell_args(protocol, action, seed, method, gpu, smoke) if argv is None else argv
+    check = validate_cell if validator is None else validator
     immutable(out/'run_config.json', dict(argv=argv[5:], protocol=protocol))
     if (out/'complete.json').exists():
-        metrics = validate_cell(out, cell, smoke)
+        metrics = check(out, cell, smoke)
         for name, digest in read(out/'complete.json')['files'].items():
             if sha(out/name) != digest:
                 raise ValueError('completed raw result changed: ' + str(out/name))
@@ -197,10 +213,14 @@ def run_cell(root, repositories, cell, gpu, smoke):
             raise ValueError('completed checkpoint missing')
         if sha(out/'model.pth') != read(out/'complete.json')['checkpoint_sha256']:
             raise ValueError('completed checkpoint changed')
+        for name in extra_checkpoints:
+            if sha(out/name) != read(out/'complete.json').get('extra_checkpoints', {}).get(name):
+                raise ValueError('completed extra checkpoint changed: ' + name)
         if protocol == 'july28' and sha(out/'model.pth.eval_rng.pt') != read(out/'complete.json')['eval_rng_sha256']:
             raise ValueError('July28 replay RNG changed')
         return 'SKIP', metrics
     required = ['model.pth', 'train_result.json', 'model.pth.selection.json', 'model.pth.epochs.jsonl']
+    required += list(extra_required) + list(extra_checkpoints)
     if mode_for(method) != 'off':
         required.append('qmd_training.json')
     if protocol == 'july28':
@@ -219,16 +239,21 @@ def run_cell(root, repositories, cell, gpu, smoke):
     replay = ['--replay_rng_path', str(out/'model.pth.eval_rng.pt')] if protocol == 'july28' else []
     command(argv + ['--test', '--ckpt_path', str(out/'model.pth'), '--result_json', str(out/'test_result.json')] + replay,
             repositories[protocol], out/'test.log')
-    metrics = validate_cell(out, cell, smoke)
+    if post_test is not None:
+        post_test(out, argv, repositories[protocol])
+    metrics = check(out, cell, smoke)
     if (out/'failure.json').exists():
         previous = read(out/'failure.json')
         previous['resolved_at'] = time.time()
         save(out/'failure.json', previous)
     files = {p.name: sha(p) for p in out.iterdir() if p.is_file() and p.suffix in ('.json', '.jsonl')
              and p.name != 'complete.json'}
-    save(out/'complete.json', dict(metrics=metrics, files=files, finished_at=time.time(),
+    completion = dict(metrics=metrics, files=files, finished_at=time.time(),
                                   checkpoint_sha256=sha(out/'model.pth'),
-                                  eval_rng_sha256=sha(out/'model.pth.eval_rng.pt') if protocol == 'july28' else None))
+                                  eval_rng_sha256=sha(out/'model.pth.eval_rng.pt') if protocol == 'july28' else None)
+    if extra_checkpoints:
+        completion['extra_checkpoints'] = {name: sha(out/name) for name in extra_checkpoints}
+    save(out/'complete.json', completion)
     return 'FINISH', metrics
 
 
@@ -239,10 +264,10 @@ def dispatch_order(jobs):
                                       tuple(METHODS).index(c[0]), c[2]))
 
 
-def run_wave(root, repositories, jobs, gpus, smoke=False):
+def run_wave(root, repositories, jobs, gpus, smoke=False, runner=None, ordering=None):
     pending = queue.Queue()
     # Both protocols participate in each wave. Greedy longest-first scheduling.
-    for job in dispatch_order(jobs):
+    for job in (dispatch_order(jobs) if ordering is None else ordering(jobs)):
         pending.put(job)
     failures = []
     def worker(gpu):
@@ -253,7 +278,7 @@ def run_wave(root, repositories, jobs, gpus, smoke=False):
                 return
             print('START GPU=' + gpu + ' ' + '/'.join(map(str, cell)), flush=True)
             try:
-                state, metrics = run_cell(root, repositories, cell, gpu, smoke)
+                state, metrics = (run_cell if runner is None else runner)(root, repositories, cell, gpu, smoke)
                 print(state + ' GPU=' + gpu + ' ' + '/'.join(map(str, cell)) + ' SRCC=' + str(metrics['srcc_x100']), flush=True)
             except Exception as error:
                 failure = dict(cell=list(cell), gpu=gpu, error=repr(error), time=time.time())
@@ -330,7 +355,7 @@ def provenance(repositories):
     paths += [Path('pretrained_models/feats2')/(a+'_'+m+'_'+f+'.pth') for a in ACTIONS
               for m,f in (('rgb','UMT'),('flow','I3D'),('audio','MAST'))]
     for relative in paths:
-        left, right = repositories['modern']/relative, repositories['july28']/relative
+        left, right = repositories['modern']/relative, repositories.get('july28', repositories['modern'])/relative
         digest = sha(left)
         if left.resolve() != right.resolve() and sha(right) != digest:
             raise ValueError('protocols use different data/pretrained weights: ' + str(relative))

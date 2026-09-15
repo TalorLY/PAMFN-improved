@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.score_head import configure_head, forward_with_pre_output
 
 from models.coqm import (
     ContinuousOrderedQualityManifold,
@@ -347,7 +348,8 @@ class PAMFN(nn.Module):
             coqm_weight=0.0, coqm_dim=128,
             coqm_temperature=0.1, coqm_theta_max=np.pi / 3,
             coqm_coord_scale=1.0, coqm_anchor_scores=(),
-            eval_policy="legacy_gumbel"):
+            eval_policy="legacy_gumbel", score_head="original",
+            score_head_diagnostics=False):
         super().__init__()
         for name, value in (
                 ("shared_rank_weight", shared_rank_weight),
@@ -531,6 +533,9 @@ class PAMFN(nn.Module):
             nn.Conv1d(model_dim // fc_r, 1, 1),
             nn.Sigmoid(),
         )
+        self.score_head = score_head
+        self.score_head_diagnostics = bool(score_head_diagnostics)
+        configure_head(self.fc, score_head)
         self.tau = nn.Parameter(torch.ones([]) * 10)
         self.mse = nn.MSELoss()
         if self.ordinal_prototype_weight > 0:
@@ -613,8 +618,13 @@ class PAMFN(nn.Module):
             [value[3] for value in feats],
             self.tau,
         )
-        score = self.fc(stage3).squeeze(dim=2)
         info = {"action": [action1, action2, action3]}
+        if self.score_head_diagnostics:
+            score, pre_output = forward_with_pre_output(self.fc, stage3)
+            score = score.squeeze(dim=2)
+            info['score_head_pre_output'] = pre_output
+        else:
+            score = self.fc(stage3).squeeze(dim=2)
         if self.ordinal_prototype_weight > 0:
             info["quality_embedding"] = F.normalize(
                 self.quality_projector(stage3.squeeze(dim=2)),

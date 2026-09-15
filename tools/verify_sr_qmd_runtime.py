@@ -47,7 +47,7 @@ def main():
     old_qmd = frozen_module(SCORE_COMMIT, 'models/score_qmd.py', 'frozen_score_qmd')
     results = {}
     device = torch.device('cuda' if args.gpu != '-1' else 'cpu')
-    for mode in ('v1_reference','current_score','zero_rank'):
+    for mode in ('v1_reference','current_score','zero_rank','reliable_floor_one'):
         pipeline.setup_seed(0)
         loader, test_loader = pipeline.build_dataset(**data_conf)
         del test_loader
@@ -58,7 +58,11 @@ def main():
         implementation = old_pipe if mode == 'v1_reference' else pipeline
         cls = old_qmd.ScoreQMD if mode == 'v1_reference' else ScoreQMD
         extra = dict(rank_weight=0.) if mode == 'zero_rank' else {}
-        qmd = cls('score_rank_qmd' if mode=='zero_rank' else 'score_qmd',0,epochs,warmup=0,rampup=0,**extra)
+        if mode == 'reliable_floor_one':
+            extra['score_gate_floor'] = 1.
+        qmd = cls('score_rank_qmd' if mode=='zero_rank' else
+                  'reliable_score_qmd' if mode=='reliable_floor_one' else 'score_qmd',
+                  0,epochs,warmup=0,rampup=0,**extra)
         data = loader
         if args.max_batches:
             from itertools import islice
@@ -77,7 +81,7 @@ def main():
         gc.collect()
         if torch.cuda.is_initialized():
             torch.cuda.empty_cache()
-    passed = results['v1_reference'] == results['current_score'] == results['zero_rank']
+    passed = all(value == results['v1_reference'] for value in results.values())
     report = dict(decision='SR_QMD_V1_PARITY_PASS' if passed else 'SR_QMD_V1_PARITY_FAIL',
                   score_commit=SCORE_COMMIT, full_epoch=args.max_batches==0, device=str(device), results=results)
     path = Path(args.output)

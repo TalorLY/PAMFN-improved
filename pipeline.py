@@ -1,4 +1,5 @@
 import os
+import json
 import time
 from contextlib import nullcontext
 
@@ -10,6 +11,7 @@ from torch.utils.data import DataLoader
 from datasets import AQADataset
 from models.coqm import preserve_torch_rng_state
 from models.score_qmd import ScoreQMD, rng_state
+from models.score_head import head_diagnostics
 from utils.utils import AverageMeter
 
 
@@ -141,7 +143,7 @@ def _spearman(predictions, labels):
 
 def train_epoch(
         model, optimizer, lr_scheduler, dataloader,
-        current_epoch, clip_grad=False, qmd=None):
+        current_epoch, clip_grad=False, qmd=None, ema=None):
     objective_losses = AverageMeter()
     mse_losses = AverageMeter()
     predictions = []
@@ -150,12 +152,17 @@ def train_epoch(
     device = _device_for(model)
     model.train()
     qmd_rows = []
+    head_pre_output = []
 
     for batch in dataloader:
         model_input, label = _prepare_batch(batch, device)
         qmd_active = qmd is not None and qmd.scale(current_epoch) > 0
+        guard = getattr(qmd, 'guard', None) if qmd_active else None
+        correction = None
         before_full = rng_state() if qmd_active else None
         prediction, other_info = model(model_input)
+        if 'score_head_pre_output' in other_info:
+            head_pre_output.extend(other_info['score_head_pre_output'].cpu().reshape(-1).tolist())
         training_loss = getattr(
             model, "call_training_loss", model.call_loss
         )
@@ -169,6 +176,10 @@ def train_epoch(
             auxiliary, diagnostic = qmd.auxiliary(
                 model, model_input, batch[4], label, prediction, mse,
                 before_full, current_epoch)
+            if guard is not None:
+                guarded_parameters = [p for p in model.parameters() if p.requires_grad]
+                correction = guard.prepare(objective, qmd._grad_terms, guarded_parameters, current_epoch)
+                qmd._grad_terms = None
             objective = objective + auxiliary
             qmd_rows.append(diagnostic)
         if not bool(torch.isfinite(objective)):
@@ -176,9 +187,13 @@ def train_epoch(
 
         optimizer.zero_grad()
         objective.backward()
+        if correction is not None:
+            guard.apply(guarded_parameters, correction)
         if clip_grad:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
 
         batch_size = label.shape[0]
         objective_losses.update(objective.item(), batch_size)
@@ -190,6 +205,8 @@ def train_epoch(
 
     if lr_scheduler is not None:
         lr_scheduler.step(current_epoch + 1)
+    if getattr(qmd, 'guard', None) is not None:
+        print('GRAD ' + json.dumps(qmd.guard.epoch_report(current_epoch), sort_keys=True), flush=True)
     if qmd is not None:
         qmd.epoch_rows.append({
             'epoch': current_epoch + 1, 'active_batches': len(qmd_rows),
@@ -208,16 +225,19 @@ def train_epoch(
         row = qmd.epoch_rows[-1]
         for key in ('accepted_samples', 'total_samples'):
             row[key] = sum(r[key] for r in qmd_rows)
-        for key in ('teacher_mae', 'student_mae', 'gated_score_kd'):
+        for key in ('teacher_mae', 'student_mae', 'gated_score_kd', 'mean_gate_weight'):
             row[key] = float(np.mean([r[key] for r in qmd_rows])) if qmd_rows else 0.
         row['acceptance_rate'] = row['accepted_samples'] / max(1, row['total_samples'])
-    return {
+    result = {
         "time": time.time() - start,
         "mse_x100": mse_losses.avg * 100,
         "objective_x100": objective_losses.avg * 100,
         # Match the official training-side scale in the epoch log.
         "coef": _spearman(predictions, labels),
     }
+    if head_pre_output:
+        result['score_head'] = head_diagnostics(model, head_pre_output, predictions, labels)
+    return result
 
 
 def _validate_eval_config(eval_policy, eval_mc_samples):
@@ -240,7 +260,7 @@ def _seed_torch_for_evaluation(seed):
 
 def test_epoch(
         model, dataloader, eval_policy="legacy_gumbel",
-        eval_mc_samples=20, eval_seed=20260908):
+        eval_mc_samples=20, eval_seed=20260908, return_predictions=False):
     _validate_eval_config(eval_policy, eval_mc_samples)
     model_eval_policy = getattr(model, "eval_policy", eval_policy)
     if model_eval_policy != eval_policy:
@@ -257,6 +277,7 @@ def test_epoch(
     coqm_curve_cosines = []
     coqm_probabilities = []
     coqm_coordinates = []
+    head_pre_output = []
     start = time.time()
     device = _device_for(model)
     model.eval()
@@ -275,6 +296,8 @@ def test_epoch(
                 pass_coqm_outputs = []
                 for _ in range(eval_passes):
                     prediction, other_info = model(model_input)
+                    if 'score_head_pre_output' in other_info:
+                        head_pre_output.extend(other_info['score_head_pre_output'].cpu().reshape(-1).tolist())
                     pass_predictions.append(prediction)
                     coqm_output = other_info.get("coqm_output")
                     if coqm_output is not None:
@@ -348,6 +371,13 @@ def test_epoch(
         "mae": float(np.mean(np.abs(prediction_array - label_array))),
         "bias": float(np.mean(prediction_array - label_array)),
     }
+    if head_pre_output:
+        result['score_head'] = head_diagnostics(model, head_pre_output, predictions, labels)
+        if getattr(model, 'score_head', 'original') == 'linear':
+            # Outside [0,1] is valid for a linear regressor, NOT sigmoid saturation.
+            result['saturation_fraction'] = None
+    if return_predictions:
+        result['predictions'] = dict(label=labels, prediction=predictions, order='native_test_loader')
     if coqm_coordinates:
         probabilities = np.asarray(
             coqm_probabilities, dtype=np.float64
@@ -402,7 +432,7 @@ def train_loop(
         save_base_model="", save_final_model="", save_moniter="",
         log_func=None, clip_grad=False,
         eval_policy="legacy_gumbel", eval_mc_samples=20,
-        eval_seed=20260908, qmd=None):
+        eval_seed=20260908, qmd=None, ema=None):
     log_func = log_func or print
     max_coef = 0.0
     max_avg_coef = 0.0
@@ -421,6 +451,7 @@ def train_loop(
             current_epoch,
             clip_grad=clip_grad,
             qmd=qmd,
+            ema=ema,
         )
         test_result = test_epoch(
             model,
@@ -434,6 +465,10 @@ def train_loop(
             _ensure_parent(save_final_model)
             with open(save_final_model + '.epochs.jsonl', 'a', encoding='utf-8') as handle:
                 handle.write(json.dumps(dict(epoch=current_epoch + 1, **test_result), sort_keys=True) + '\n')
+            if 'score_head' in train_result:
+                with open(save_final_model + '.head.jsonl', 'a', encoding='utf-8') as handle:
+                    handle.write(json.dumps(dict(epoch=current_epoch + 1,
+                        train=train_result['score_head'], test=test_result['score_head']), sort_keys=True) + '\n')
         test_losses.append(test_result["loss_x100"])
         if qmd is not None:
             import json
@@ -468,6 +503,11 @@ def train_loop(
         max_avg_coef = max(max_avg_coef, average_coef)
         min_loss = min(min_loss, test_result["loss_x100"])
         min_avg_loss = min(min_avg_loss, average_loss)
+        if ema is not None:
+            import json
+            shadows = ema.evaluate(model, current_epoch + 1, test_dataloader,
+                                   test_epoch, _prepare_batch, eval_seed)
+            log_func('EMA ' + json.dumps(dict(epoch=current_epoch + 1, views=shadows), sort_keys=True))
         log_func(
             "Epoch[{0}/{1}] \t"
             "Time: {train_time:.1f}/{test_time:.1f} \t"
@@ -495,6 +535,8 @@ def train_loop(
             )
         )
 
+    if ema is not None:
+        ema.finish()
     return (
         max_avg_coef,
         max_coef,
@@ -509,7 +551,7 @@ def go(
         dataset_kwargs, epoch_num, save_base_model="",
         save_final_model="", save_moniter="", log_func=None,
         seed=0, clip_grad=False, eval_policy="legacy_gumbel",
-        eval_mc_samples=20, eval_seed=20260908, qmd_config=None, qmd_report_path=''):
+        eval_mc_samples=20, eval_seed=20260908, qmd_config=None, qmd_report_path='', ema_screen=False):
     log_func = log_func or print
     setup_seed(seed)
     train_loader, test_loader = build_dataset(**dataset_kwargs)
@@ -527,6 +569,10 @@ def go(
     )
     model.to(device)
     qmd = ScoreQMD(seed=seed, epochs=epoch_num, **qmd_config) if qmd_config else None
+    ema = None
+    if ema_screen:
+        from models.ema_shadow import EMAShadow
+        ema = EMAShadow(model, train_loader.dataset, save_final_model)
     results = train_loop(
         model,
         optimizer,
@@ -543,6 +589,7 @@ def go(
         eval_mc_samples=eval_mc_samples,
         eval_seed=eval_seed,
         qmd=qmd,
+        ema=ema,
     )
     if qmd is not None and qmd_report_path:
         import json
@@ -575,7 +622,7 @@ def _load_state_dict(path):
 def test_model(
         model_kwargs, dataset_kwargs, ckpt_path="",
         log_func=None, seed=0, eval_policy="legacy_gumbel",
-        eval_mc_samples=20, eval_seed=20260908):
+        eval_mc_samples=20, eval_seed=20260908, return_predictions=False):
     log_func = log_func or print
     setup_seed(seed)
     _, test_loader = build_dataset(**dataset_kwargs)
@@ -591,6 +638,7 @@ def test_model(
         eval_policy=eval_policy,
         eval_mc_samples=eval_mc_samples,
         eval_seed=eval_seed,
+        return_predictions=return_predictions,
     )
     log_func(
         f"Coef: {result['coef'] / 100:.4f}\t"

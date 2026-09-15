@@ -4,6 +4,7 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
+from models.qmd_calibration import WindowCalibration
 
 
 def rng_state():
@@ -90,13 +91,16 @@ def score_kd(masked_score, full_score):
     return F.smooth_l1_loss(masked_score.reshape(-1), full_score.detach().reshape(-1))
 
 
-def reliable_score_kd(masked_score, full_score, label):
-    """Distill only when the detached full-view teacher beats the student.
+def reliable_score_kd(masked_score, full_score, label, floor=0.0):
+    """Weight KD by detached training-label reliability, with an optional floor.
 
-    Mean over ALL samples: rejected samples really weaken distillation.
+    Floor zero is the original hard gate; floor one is ordinary score KD.
+    Mean over ALL samples: downweighted samples really weaken distillation.
     Calibration stays based on ungated KD, so it cannot normalize away the gate.
     Ground truth is from the training batch only; Mask-GT remains unconditional.
     """
+    if not math.isfinite(floor) or not 0 <= floor <= 1:
+        raise ValueError('score gate floor must be in [0, 1]')
     student = masked_score.reshape(-1)
     teacher = full_score.detach().reshape(-1)
     target = label.detach().reshape(-1)
@@ -106,11 +110,14 @@ def reliable_score_kd(masked_score, full_score, label):
     student_error = (student.detach() - target).abs()
     gate = (teacher_error < student_error).to(student.dtype)
     losses = F.smooth_l1_loss(student, teacher, reduction='none')
-    return (gate * losses).mean(), {
+    # Preserve the original hard-gate arithmetic exactly when floor is zero.
+    weight = gate if floor == 0 else floor + (1.0 - floor) * gate
+    return (weight * losses).mean(), {
         'accepted_samples': int(gate.sum()), 'total_samples': len(gate),
         'teacher_mae': float(teacher_error.mean()),
         'student_mae': float(student_error.mean()),
         'acceptance_rate': float(gate.mean()),
+        'mean_gate_weight': float(weight.mean()),
     }
 
 
@@ -151,7 +158,19 @@ def gradient_norm(loss, parameters):
 class ScoreQMD:
     def __init__(self, mode, seed, epochs, weight=1.0, mask_ratio=0.15,
                  mask_gt_weight=0.5, target_ratio=0.075, beta_cap=1.0,
-                 warmup=0.1, rampup=0.1, rank_weight=0.5, rank_gap=0.05, rank_gamma=0.1):
+                 warmup=0.1, rampup=0.1, rank_weight=0.5, rank_gap=0.05, rank_gamma=0.1,
+                 score_gate_floor=0.0, calibration_mode='single', calibration_batches=9, grad_mode='off'):
+        from tools.qmd_gradient import GradientGuard, MODES
+        if grad_mode not in MODES or (grad_mode != 'off' and mode != 'score_qmd'):
+            raise ValueError('gradient guard requires ordinary Score-QMD')
+        self.guard = GradientGuard(grad_mode) if grad_mode != 'off' else None
+        if calibration_mode not in ('single', 'shared', 'modality'):
+            raise ValueError('unknown QMD calibration mode')
+        if calibration_mode != 'single' and mode != 'score_qmd':
+            raise ValueError('window calibration requires ordinary score_qmd')
+        self.window = (WindowCalibration(calibration_mode, calibration_batches, target_ratio,
+                                        beta_cap, weight) if calibration_mode != 'single' else None)
+        self.kd_applied_batches = {m: 0 for m in ('V', 'F', 'A')}
         if mode not in ('off', 'mask_gt', 'score_qmd', 'score_rank_qmd', 'reliable_score_qmd'):
             raise ValueError('invalid QMD mode')
         for value in (weight, mask_gt_weight, target_ratio, beta_cap, warmup, rampup):
@@ -159,6 +178,11 @@ class ScoreQMD:
                 raise ValueError('QMD weights and schedule must be finite and nonnegative')
         if epochs < 1 or warmup + rampup > 1:
             raise ValueError('invalid QMD schedule')
+        if not math.isfinite(score_gate_floor) or not 0 <= score_gate_floor <= 1:
+            raise ValueError('score gate floor must be in [0, 1]')
+        if score_gate_floor and mode != 'reliable_score_qmd':
+            raise ValueError('gate floor requires reliable_score_qmd')
+        self.score_gate_floor = score_gate_floor
         if (not math.isfinite(rank_weight) or rank_weight < 0 or
                 not math.isfinite(rank_gap) or rank_gap < 0 or
                 not math.isfinite(rank_gamma) or rank_gamma <= 0):
@@ -176,6 +200,7 @@ class ScoreQMD:
         self.epoch_rows = []
         self.accepted_samples = self.total_samples = 0
         self.score_gradient_verified = False
+        self.view_rows = {}
 
     def scale(self, epoch):
         if self.mode == 'off' or self.weight == 0:
@@ -188,7 +213,19 @@ class ScoreQMD:
         prediction, _ = paired_masked_forward(model, masked, before_full)
         gt = F.mse_loss(prediction.reshape(-1), label.reshape(-1))
         kd = score_kd(prediction, full_score)
-        if self.mode in ('score_qmd', 'score_rank_qmd', 'reliable_score_qmd') and self.beta is None:
+        if self.window is not None:
+            # Read beta BEFORE observing: the entire window has no KD updates.
+            beta = self.window.beta_for(mask_info['modality'])
+            if self.window.report is None:
+                parameters = [p for p in model.fc.parameters() if p.requires_grad]
+                self.window.observe(mask_info['modality'], gradient_norm(full_mse, parameters),
+                                    gradient_norm(kd, parameters), label.numel(), epoch)
+                self.calibration = self.window.report
+                if self.calibration is not None:
+                    self.beta = dict(self.calibration['beta'])
+            if beta > 0 and float(kd.detach()) > 0:
+                self.kd_applied_batches[mask_info['modality']] += 1
+        elif self.mode in ('score_qmd', 'score_rank_qmd', 'reliable_score_qmd') and self.beta is None:
             # First active, deterministically ordered training batch after warm-up.
             # Use score-head parameter gradients shared by both view graphs.
             parameters = [p for p in model.fc.parameters() if p.requires_grad]
@@ -208,13 +245,14 @@ class ScoreQMD:
                 'degenerate': main_norm <= 1e-12 or kd_norm <= 1e-12,
                 'capped': raw > self.beta_cap,
             }
-        beta = self.beta if self.mode in ('score_qmd', 'score_rank_qmd', 'reliable_score_qmd') else 0.0
+        if self.window is None:
+            beta = self.beta if self.mode in ('score_qmd', 'score_rank_qmd', 'reliable_score_qmd') else 0.0
         self.active_batches += 1
         self.modality_counts[mask_info['modality']] += 1
         gated_info = {}
         effective_kd = kd
         if self.mode == 'reliable_score_qmd':
-            effective_kd, gated_info = reliable_score_kd(prediction, full_score, label)
+            effective_kd, gated_info = reliable_score_kd(prediction, full_score, label, self.score_gate_floor)
             self.accepted_samples += gated_info['accepted_samples']
             self.total_samples += gated_info['total_samples']
             if not self.score_gradient_verified and float(effective_kd.detach()) > 0:
@@ -238,12 +276,41 @@ class ScoreQMD:
                 self.rank_gradient_batches += int(bool(torch.isfinite(gradient).all())
                                                   and float(gradient.abs().sum()) > 0)
             diagnostics.update(rank_kd=float(rank.detach()), **info)
+        self.record_views(prediction, full_score, label, mask_info, epoch)
+        if self.guard is not None:
+            self._grad_terms = (self.scale(epoch) * self.mask_gt_weight * gt,
+                                self.scale(epoch) * beta * kd, mask_info['modality'])
         return loss, diagnostics
+
+    def record_views(self, prediction, full_score, label, mask_info, epoch):
+        """Detached training-only diagnostics, no extra model call or randomness."""
+        teacher = full_score.detach().reshape(-1)
+        student = prediction.detach().reshape(-1)
+        target = label.detach().reshape(-1)
+        key = (epoch + 1, mask_info['modality'])
+        row = self.view_rows.setdefault(key, dict(epoch=epoch + 1, modality=key[1],
+            samples=0, teacher_abs_error_sum=0., student_abs_error_sum=0.,
+            accepted_samples=0, teacher_sum=0., teacher_square_sum=0.,
+            student_sum=0., student_square_sum=0.))
+        full_error, masked_error = (teacher-target).abs(), (student-target).abs()
+        row['samples'] += len(target)
+        row['teacher_abs_error_sum'] += float(full_error.sum())
+        row['student_abs_error_sum'] += float(masked_error.sum())
+        row['accepted_samples'] += int((full_error < masked_error).sum())
+        for name, value in (('teacher',teacher),('student',student)):
+            row[name+'_sum'] += float(value.double().sum())
+            row[name+'_square_sum'] += float(value.double().square().sum())
 
     def summary(self):
         result = {'mode': self.mode, 'active_batches': self.active_batches,
                 'modality_counts': self.modality_counts, 'calibration': self.calibration,
-                'epochs': self.epoch_rows}
+                'epochs': self.epoch_rows,
+                'view_diagnostics': {'scope': 'training batches grouped by masked modality and epoch',
+                                     'rows': [self.view_rows[k] for k in sorted(self.view_rows)]}}
+        if self.window is not None:
+            result['window_progress'] = dict(mode=self.window.mode, requested_batches=self.window.batches,
+                collected_batches=len(self.window.observations), frozen=self.window.report is not None,
+                kd_applied_batches=dict(self.kd_applied_batches))
         if self.mode == 'score_rank_qmd':
             result['rank'] = dict(weight=self.rank_weight, gap=self.rank_gap, gamma=self.rank_gamma,
                                   normalization='eligible_pair_count', eligible_pairs=self.rank_pairs,
@@ -253,5 +320,8 @@ class ScoreQMD:
             result['score_gate'] = dict(
                 rule='abs(full-y) < abs(masked-y)', normalization='all_samples',
                 calibration='ungated_score_kd', accepted_samples=self.accepted_samples,
-                total_samples=self.total_samples, gradient_verified=self.score_gradient_verified)
+                total_samples=self.total_samples, gradient_verified=self.score_gradient_verified,
+                floor=self.score_gate_floor)
+        if self.guard is not None:
+            result['gradient_guard'] = self.guard.summary()
         return result

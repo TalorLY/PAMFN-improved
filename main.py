@@ -170,12 +170,20 @@ def parser_args():
         ),
     )
     parser.add_argument("--test", action="store_true")
+    parser.add_argument('--score_head', choices=('original', 'linear', 'groupnorm'), default='original')
+    parser.add_argument('--score_head_diagnostics', action='store_true')
+    parser.add_argument('--ema_screen', action='store_true')
+    parser.add_argument('--ema_view', choices=('online', 'online_bn', 'ema_short', 'ema_long'), default='online')
     parser.add_argument('--qmd_mode', choices=('off', 'mask_gt', 'score_qmd', 'score_rank_qmd', 'reliable_score_qmd'), default='off')
     parser.add_argument('--qmd_weight', type=float, default=1.0)
+    parser.add_argument('--qmd_grad_mode', choices=('off', 'observe', 'kd', 'all'), default='off')
+    parser.add_argument('--qmd_score_gate_floor', type=float, default=0.0)
     parser.add_argument('--qmd_mask_ratio', type=float, default=0.15)
     parser.add_argument('--qmd_gt_weight', type=float, default=0.5)
     parser.add_argument('--qmd_target_ratio', type=float, default=0.075)
     parser.add_argument('--qmd_beta_cap', type=float, default=1.0)
+    parser.add_argument('--qmd_calibration_mode', choices=('single', 'shared', 'modality'), default='single')
+    parser.add_argument('--qmd_calibration_batches', type=int, default=9)
     parser.add_argument('--qmd_warmup', type=float, default=0.1)
     parser.add_argument('--qmd_rampup', type=float, default=0.1)
     parser.add_argument('--qmd_rank_weight', type=float, default=0.5)
@@ -188,11 +196,32 @@ def parser_args():
 
 
 def validate_args(parser, args):
+    if args.ema_view != 'online' and (not args.test or not args.ema_screen):
+        parser.error('--ema_view is only for --test --ema_screen checkpoint reloads')
+    if args.ema_screen:
+        if (not args.multi_modality or args.score_head != 'original' or args.eval_policy != 'argmax'
+                or args.ordinal_prototype_weight or args.coqm_weight or args.qmd_mode != 'score_qmd'
+                or args.shared_rank_weight or args.shared_list_weight or args.qmd_calibration_mode != 'single'):
+            parser.error('EMA screen requires original Score-QMD, original head, argmax and no Ordered/COQM')
+        if not args.test and not args.save_final_model:
+            parser.error('--ema_screen requires --save_final_model')
+    if (args.score_head != 'original' or args.score_head_diagnostics) and not args.multi_modality:
+        parser.error('score head experiments require --multi_modality')
+    if args.qmd_calibration_batches < 6 or args.qmd_calibration_batches % 3:
+        parser.error('--qmd_calibration_batches must be a multiple of 3 and at least 6')
+    if args.qmd_calibration_mode != 'single' and args.qmd_mode != 'score_qmd':
+        parser.error('window calibration requires --qmd_mode score_qmd')
+    if not math.isfinite(args.qmd_score_gate_floor) or not 0 <= args.qmd_score_gate_floor <= 1:
+        parser.error('--qmd_score_gate_floor must be in [0, 1]')
+    if args.qmd_score_gate_floor and args.qmd_mode != 'reliable_score_qmd':
+        parser.error('--qmd_score_gate_floor requires reliable_score_qmd')
     for key in ('qmd_weight', 'qmd_gt_weight', 'qmd_target_ratio', 'qmd_beta_cap',
                 'qmd_warmup', 'qmd_rampup', 'qmd_rank_weight', 'qmd_rank_gap', 'qmd_rank_gamma'):
         value = getattr(args, key)
         if not math.isfinite(value) or value < 0:
             parser.error('--' + key + ' must be finite and nonnegative')
+    if args.qmd_grad_mode != 'off' and (args.qmd_mode != 'score_qmd' or args.qmd_weight <= 0):
+        parser.error('gradient guard requires active ordinary Score-QMD')
     if not 0 < args.qmd_mask_ratio < 1 or args.qmd_warmup + args.qmd_rampup > 1:
         parser.error('invalid QMD mask ratio or warmup/rampup')
     if args.qmd_rank_gamma <= 0:
@@ -387,6 +416,8 @@ def build_configs(args, config):
                 "coqm_coord_scale": args.coqm_coord_scale,
                 "coqm_anchor_scores": coqm_anchor_scores,
                 "eval_policy": args.eval_policy,
+                "score_head": args.score_head,
+                "score_head_diagnostics": args.score_head_diagnostics,
             },
         }
     else:
@@ -550,6 +581,7 @@ def main():
             eval_policy=args.eval_policy,
             eval_mc_samples=args.eval_mc_samples,
             eval_seed=args.eval_seed,
+            return_predictions=args.qmd_grad_mode != 'off',
         )
         result["run"] = _run_metadata(args, epoch_num)
         _write_result_json(args.result_json, result)
@@ -573,6 +605,7 @@ def main():
         qmd_config=(qmd_config(args) if args.qmd_mode != 'off' and args.qmd_weight > 0 else None),
         qmd_report_path=(os.path.join(os.path.dirname(args.result_json), 'qmd_training.json')
                          if args.result_json else ''),
+        ema_screen=args.ema_screen,
     )
     _write_result_json(args.result_json, {
         "best_avg_srcc": results[0] / 100,
@@ -595,7 +628,7 @@ def _write_result_json(path, result):
 
 
 def _run_metadata(args, epoch_num):
-    return {
+    result = {
         "tag": args.run_tag,
         "action": args.action,
         "seed": args.seed,
@@ -628,6 +661,12 @@ def _run_metadata(args, epoch_num):
                                  order_scale=args.ordinal_prototype_order_scale)
                            if args.ordinal_prototype_weight > 0 else None),
     }
+    if args.score_head != 'original' or args.score_head_diagnostics:
+        result['score_head'] = dict(variant=args.score_head, diagnostics=args.score_head_diagnostics)
+    if args.ema_screen:
+        from models.ema_shadow import recipe
+        result['ema'] = dict(recipe=recipe(), view=args.ema_view)
+    return result
 
 
 def qmd_config(args):
@@ -638,6 +677,13 @@ def qmd_config(args):
     if args.qmd_mode == 'score_rank_qmd':
         config.update(rank_weight=args.qmd_rank_weight, rank_gap=args.qmd_rank_gap,
                       rank_gamma=args.qmd_rank_gamma)
+    if args.qmd_mode == 'reliable_score_qmd':
+        config['score_gate_floor'] = args.qmd_score_gate_floor
+    if args.qmd_calibration_mode != 'single':
+        config.update(calibration_mode=args.qmd_calibration_mode,
+                      calibration_batches=args.qmd_calibration_batches)
+    if getattr(args, 'qmd_grad_mode', 'off') != 'off':
+        config['grad_mode'] = args.qmd_grad_mode
     return config
 
 
