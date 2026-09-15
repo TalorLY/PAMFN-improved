@@ -149,6 +149,8 @@ def train_epoch(
     for batch in dataloader:
         model_input, label = _prepare_batch(batch, device)
         qmd_active = qmd is not None and qmd.scale(current_epoch) > 0
+        guard = getattr(qmd, 'guard', None) if qmd_active else None
+        correction = None
         before_full = rng_state() if qmd_active else None
         prediction, other_info = model(model_input)
         training_loss = getattr(
@@ -164,6 +166,10 @@ def train_epoch(
             auxiliary, diagnostic = qmd.auxiliary(
                 model, model_input, batch[4], label, prediction, mse,
                 before_full, current_epoch)
+            if guard is not None:
+                guarded_parameters = [p for p in model.parameters() if p.requires_grad]
+                correction = guard.prepare(objective, qmd._grad_terms, guarded_parameters, current_epoch)
+                qmd._grad_terms = None
             objective = objective + auxiliary
             qmd_rows.append(diagnostic)
         if not bool(torch.isfinite(objective)):
@@ -171,6 +177,8 @@ def train_epoch(
 
         optimizer.zero_grad()
         objective.backward()
+        if correction is not None:
+            guard.apply(guarded_parameters, correction)
         if clip_grad:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
         optimizer.step()
@@ -185,6 +193,8 @@ def train_epoch(
 
     if lr_scheduler is not None:
         lr_scheduler.step(current_epoch + 1)
+    if getattr(qmd, 'guard', None) is not None:
+        print('GRAD ' + json.dumps(qmd.guard.epoch_report(current_epoch), sort_keys=True), flush=True)
     if qmd is not None:
         qmd.epoch_rows.append({
             'epoch': current_epoch + 1, 'active_batches': len(qmd_rows),
@@ -208,7 +218,7 @@ def train_epoch(
     }
 
 
-def test_epoch(model, dataloader):
+def test_epoch(model, dataloader, return_predictions=False):
     losses = AverageMeter()
     predictions = []
     labels = []
@@ -231,7 +241,7 @@ def test_epoch(model, dataloader):
 
     values = np.asarray(predictions, dtype=np.float64)
     targets = np.asarray(labels, dtype=np.float64)
-    return {
+    result = {
         "prediction_std": float(values.std()),
         "saturation_fraction": float(np.mean((values < .001) | (values > .999))),
         "prediction_std_ratio": float(values.std() / targets.std()),
@@ -239,6 +249,9 @@ def test_epoch(model, dataloader):
         "loss_x100": losses.avg * 100,
         "coef": _spearman(predictions, labels) * 100,
     }
+    if return_predictions:
+        result['predictions'] = dict(label=labels, prediction=predictions, order='native_test_loader')
+    return result
 
 
 def _ensure_parent(path):
@@ -410,7 +423,7 @@ def _load_state_dict(path):
 
 def test_model(
         model_kwargs, dataset_kwargs, ckpt_path="",
-        log_func=None, seed=0, replay_rng_path=""):
+        log_func=None, seed=0, replay_rng_path="", return_predictions=False):
     log_func = log_func or print
     setup_seed(seed)
     _, test_loader = build_dataset(**dataset_kwargs)
@@ -424,7 +437,8 @@ def test_model(
         saved_rng = _load_state_dict(replay_rng_path)
         set_rng_state(saved_rng[0])
         np.random.set_state(saved_rng[1])
-    result = test_epoch(model, test_loader)
+    result = (test_epoch(model, test_loader, return_predictions=True) if return_predictions
+              else test_epoch(model, test_loader))
     result['evaluation'] = dict(policy='legacy_gumbel', replayed_rng=bool(replay_rng_path))
     log_func(
         f"Coef: {result['coef'] / 100:.4f}\t"

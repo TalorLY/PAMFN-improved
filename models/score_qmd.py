@@ -127,7 +127,22 @@ def gradient_norm(loss, parameters):
 class ScoreQMD:
     def __init__(self, mode, seed, epochs, weight=1.0, mask_ratio=0.15,
                  mask_gt_weight=0.5, target_ratio=0.075, beta_cap=1.0,
-                 warmup=0.1, rampup=0.1, rank_weight=0.5, rank_gap=0.05, rank_gamma=0.1):
+                 warmup=0.1, rampup=0.1, rank_weight=0.5, rank_gap=0.05, rank_gamma=0.1, grad_mode='off', terms='both'):
+        if terms not in ('both', 'gt', 'kd'):
+            raise ValueError('invalid QMD terms')
+        if terms != 'both' and (mode != 'score_qmd' or grad_mode != 'off' or weight <= 0):
+            raise ValueError('split terms require active Score-QMD without gradient projection')
+        if terms == 'gt' and mask_gt_weight <= 0:
+            raise ValueError('GT-only requires a positive GT weight')
+        if terms == 'kd' and (target_ratio <= 0 or beta_cap <= 0):
+            raise ValueError('KD-only requires positive calibration ratio and cap')
+        self.terms = terms
+        self.components = dict(terms=terms, batches=0, weighted_gt_sum=0., weighted_kd_sum=0.,
+                               gradient_verified=False, first_positive_head_gradient_norm=None)
+        from tools.qmd_gradient import GradientGuard, MODES
+        if grad_mode not in MODES or (grad_mode != 'off' and mode != 'score_qmd'):
+            raise ValueError('gradient guard requires ordinary Score-QMD')
+        self.guard = GradientGuard(grad_mode) if grad_mode != 'off' else None
         if mode not in ('off', 'mask_gt', 'score_qmd', 'score_rank_qmd'):
             raise ValueError('invalid QMD mode')
         for value in (weight, mask_gt_weight, target_ratio, beta_cap, warmup, rampup):
@@ -186,6 +201,22 @@ class ScoreQMD:
         self.active_batches += 1
         self.modality_counts[mask_info['modality']] += 1
         loss = self.scale(epoch) * (self.mask_gt_weight * gt + beta * kd)
+        if self.terms != 'both':
+            # Keep the original forward, mask, teacher and beta calibration. Only
+            # remove one update signal; retain zero terms to match old ablations.
+            gt_weight = self.mask_gt_weight if self.terms == 'gt' else 0.0
+            kd_weight = beta if self.terms == 'kd' else 0.0
+            loss = self.scale(epoch) * (gt_weight * gt + kd_weight * kd)
+            self.components['batches'] += 1
+            self.components['weighted_gt_sum'] += self.scale(epoch) * gt_weight * float(gt.detach())
+            self.components['weighted_kd_sum'] += self.scale(epoch) * kd_weight * float(kd.detach())
+            if not self.components['gradient_verified']:
+                norm = gradient_norm(loss, [p for p in model.fc.parameters() if p.requires_grad])
+                if not math.isfinite(norm):
+                    raise FloatingPointError('non-finite split auxiliary gradient')
+                self.components['gradient_verified'] = norm > 0
+                if norm > 0:
+                    self.components['first_positive_head_gradient_norm'] = norm
         diagnostics = {'mask_gt': float(gt.detach()), 'score_kd': float(kd.detach()),
                        'beta': beta, 'scale': self.scale(epoch)}
         if self.mode == 'score_rank_qmd' and self.rank_weight > 0:
@@ -201,6 +232,9 @@ class ScoreQMD:
                 self.rank_gradient_batches += int(bool(torch.isfinite(gradient).all())
                                                   and float(gradient.abs().sum()) > 0)
             diagnostics.update(rank_kd=float(rank.detach()), **info)
+        if self.guard is not None:
+            self._grad_terms = (self.scale(epoch) * self.mask_gt_weight * gt,
+                                self.scale(epoch) * beta * kd, mask_info['modality'])
         return loss, diagnostics
 
     def summary(self):
@@ -212,4 +246,8 @@ class ScoreQMD:
                                   normalization='eligible_pair_count', eligible_pairs=self.rank_pairs,
                                   eligible_batches=self.rank_batches,
                                   gradient_verified=self.rank_gradient_batches > 0)
+        if self.guard is not None:
+            result['gradient_guard'] = self.guard.summary()
+        if self.terms != 'both':
+            result['components'] = dict(self.components)
         return result

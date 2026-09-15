@@ -33,6 +33,7 @@ def main():
     p.add_argument('--output', required=True)
     p.add_argument('--action', default='Ball', choices=('Ball','TES'))
     p.add_argument('--max_batches', type=int, default=0)
+    p.add_argument('--base', action='store_true', help='Check original PAMFN MSE without Ordered')
     args = p.parse_args()
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -47,7 +48,7 @@ def main():
     original = frozen('pipeline.py')
     original.AQADataset = frozen('datasets.py').AQADataset
     sys.argv = ['main.py','--gpu',args.gpu,'--feats','2','--action',args.action,
-                '--seed','0','--multi_modality','--ordinal_prototype_weight','.0001']
+                '--seed','0','--multi_modality','--ordinal_prototype_weight','0' if args.base else '.0001']
     config = entry.parser_args()
     current, epochs, data, model_conf, optim_conf, sched_conf = entry.build_configs(config, entry.load_config(args.action,2))
     if os.name == 'nt':
@@ -83,7 +84,7 @@ def main():
             torch.cuda.empty_cache()
     passed = results['frozen'] == results['off'] == results['zero']
     report = dict(decision='JULY28_PARITY_PASS' if passed else 'JULY28_PARITY_FAIL',
-                  commit=COMMIT, action=args.action, full_epoch=args.max_batches==0,
+                  commit=COMMIT, action=args.action, base=args.base, full_epoch=args.max_batches==0,
                   device=args.gpu, results=results)
     path = Path(args.output)
     path.parent.mkdir(parents=True,exist_ok=True)

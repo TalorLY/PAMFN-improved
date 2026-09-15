@@ -106,6 +106,9 @@ def parser_args():
     parser.add_argument("--test", action="store_true")
     parser.add_argument('--qmd_mode', choices=('off', 'mask_gt', 'score_qmd', 'score_rank_qmd'), default='off')
     parser.add_argument('--qmd_weight', type=float, default=1.0)
+    parser.add_argument('--qmd_grad_mode', choices=('off', 'observe', 'kd', 'all'), default='off')
+    parser.add_argument('--qmd_terms', choices=('both', 'gt', 'kd'), default='both',
+                        help='Select auxiliary update signals; original forward/calibration are retained')
     parser.add_argument('--qmd_mask_ratio', type=float, default=0.15)
     parser.add_argument('--qmd_gt_weight', type=float, default=0.5)
     parser.add_argument('--qmd_target_ratio', type=float, default=0.075)
@@ -116,6 +119,8 @@ def parser_args():
     parser.add_argument('--qmd_rank_gap', type=float, default=0.05)
     parser.add_argument('--qmd_rank_gamma', type=float, default=0.1)
     parser.add_argument('--result_json', default='')
+    parser.add_argument('--save_test_predictions', action='store_true',
+                        help='Save existing test predictions; does not change training or inference')
     parser.add_argument('--run_tag', default='')
     parser.add_argument('--replay_rng_path', default='')
     parser.add_argument("--print_flops", action="store_true")
@@ -130,6 +135,15 @@ def validate_args(parser, args):
         value = getattr(args, key)
         if not math.isfinite(value) or value < 0:
             parser.error('--' + key + ' must be finite and nonnegative')
+    if args.qmd_grad_mode != 'off' and (args.qmd_mode != 'score_qmd' or args.qmd_weight <= 0):
+        parser.error('gradient guard requires active ordinary Score-QMD')
+    if args.qmd_terms != 'both':
+        if args.qmd_mode != 'score_qmd' or args.qmd_grad_mode != 'off' or args.qmd_weight <= 0:
+            parser.error('split terms require active Score-QMD without gradient projection')
+        if args.qmd_terms == 'gt' and args.qmd_gt_weight <= 0:
+            parser.error('GT-only requires a positive GT weight')
+        if args.qmd_terms == 'kd' and (args.qmd_target_ratio <= 0 or args.qmd_beta_cap <= 0):
+            parser.error('KD-only requires positive calibration ratio and cap')
     if not 0 < args.qmd_mask_ratio < 1 or args.qmd_warmup + args.qmd_rampup > 1:
         parser.error('invalid QMD mask ratio or warmup/rampup')
     if args.qmd_rank_gamma <= 0:
@@ -385,6 +399,7 @@ def main():
             log_func=log_func,
             seed=args.seed,
             replay_rng_path=args.replay_rng_path,
+            return_predictions=args.qmd_mode != 'off' or args.save_test_predictions,
         )
         result['run'] = run_metadata(args, epoch_num)
         write_json(args.result_json, result)
@@ -436,6 +451,10 @@ def qmd_config(args):
     if args.qmd_mode == 'score_rank_qmd':
         config.update(rank_weight=args.qmd_rank_weight, rank_gap=args.qmd_rank_gap,
                       rank_gamma=args.qmd_rank_gamma)
+    if getattr(args, 'qmd_grad_mode', 'off') != 'off':
+        config['grad_mode'] = args.qmd_grad_mode
+    if getattr(args, 'qmd_terms', 'both') != 'both':
+        config['terms'] = args.qmd_terms
     return config
 
 
