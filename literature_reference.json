@@ -1,0 +1,16 @@
+{
+  "scope": "Published values for context only, NOT fresh matched baselines and NOT a current SOTA survey",
+  "source": "https://arxiv.org/html/2402.09444v1",
+  "table": "III, strong features",
+  "metric": "SRCC x 100; Fisher-z across tasks within each dataset",
+  "paper_rows": [
+    {"method": "GDLT", "RG": 77.6, "FisV": 77.3, "modalities": "RGB"},
+    {"method": "Joint-VA", "RG": 76.3, "FisV": 81.2, "modalities": "RGB+audio"},
+    {"method": "MSAF", "RG": 79.4, "FisV": 82.1, "modalities": "RGB+flow+audio"},
+    {"method": "UMT fusion", "RG": 75.3, "FisV": 77.4, "modalities": "RGB+audio"},
+    {"method": "PAMFN", "RG": 83.5, "FisV": 83.2, "modalities": "RGB+flow+audio"}
+  ],
+  "paper_multimodal_epochs": {"Ball": 400, "Clubs": 500, "Hoop": 300, "Ribbon": 500, "TES": 500, "PCS": 500},
+  "v17_multimodal_epochs": {"Ball": 500, "Clubs": 100, "Hoop": 300, "Ribbon": 20, "TES": 100, "PCS": 100},
+  "next_required": "Keep v29/v30 matched tables separate; audit competitive methods, input modalities/features, splits, budgets and model-selection rules before launching a separately labeled matched comparison."
+}
