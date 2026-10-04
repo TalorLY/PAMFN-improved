@@ -1,0 +1,19 @@
+{
+  "checkpoint_bytes": {
+    "mc_ordered": 41943040,
+    "mc_e": 262144,
+    "mc_u": 262144,
+    "mc_ordered_e": 262144,
+    "mc_ordered_u": 262144
+  },
+  "measurement": {
+    "scope": "Local torch2.9 CPU serialized state; budget rounded upward for server serialization and metadata differences",
+    "mc_ordered_measured_bytes": 36877737,
+    "e_measured_bytes": 21585,
+    "u_measured_bytes": 60348,
+    "rng_measured_bytes": 14313,
+    "backbone_parameters": 9122183
+  },
+  "reserve_gib": 8,
+  "policy": "Read-only old checkpoints/features; only one selected checkpoint per successful stage. Keep failed attempts for diagnosis. Check free space before launch and each new stage. Never auto-delete."
+}
