@@ -1,0 +1,2 @@
+# Keep SHA256-bound historical bytes identical on Windows and Linux.
+* -text

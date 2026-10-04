@@ -1,0 +1,475 @@
+import os
+import time
+import json
+from models.score_qmd import ScoreQMD, rng_state, set_rng_state
+
+import numpy as np
+import torch
+from scipy.stats import spearmanr
+from torch.utils.data import DataLoader
+
+from datasets import AQADataset
+from utils.lr_scheduler import build_scheduler
+from utils.utils import AverageMeter
+
+
+def build_dataset(
+        dataset_name, feat_dir, rgb_feat, flow_feat, audio_feat,
+        batch_size=32, num_workers=2, segments=-1, return_valid_lengths=False):
+    """Build the official full train/test loaders without split overrides."""
+    train_dataset = AQADataset(
+        dataset_name=dataset_name,
+        feat_dir=feat_dir,
+        rgb_feat=rgb_feat,
+        flow_feat=flow_feat,
+        audio_feat=audio_feat,
+        squeeze_rgb_feat="mean",
+        segments=segments,
+        is_train=True,
+        return_valid_lengths=return_valid_lengths,
+        sequence_sampling="legacy",
+    )
+    test_dataset = AQADataset(
+        dataset_name=dataset_name,
+        feat_dir=feat_dir,
+        rgb_feat=rgb_feat,
+        flow_feat=flow_feat,
+        audio_feat=audio_feat,
+        squeeze_rgb_feat="mean",
+        segments=segments,
+        is_train=False,
+        sequence_sampling="legacy",
+    )
+    # Intentionally match the official repository: no private generator and
+    # no custom worker_init_fn. This preserves its shuffle/crop RNG path.
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        pin_memory=False,
+        num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        pin_memory=False,
+        num_workers=num_workers,
+    )
+    return train_loader, test_loader
+
+
+def build_model(model_name, model_conf=None):
+    if model_name == "pamfn_base":
+        from models.pamfn import BaseModel
+        return BaseModel(**model_conf)
+    if model_name == "pamfn_final":
+        from models.pamfn import PAMFN
+        return PAMFN(**model_conf)
+    raise ValueError(f"model: {model_name} is not supported")
+
+
+def build_optimizer(
+        model, optim, lr, momentum=0.9, weight_decay=None,
+        reduce_fc_lr=False, model_name=None):
+    if reduce_fc_lr and model_name == "pamfn_final":
+        fc_ids = {id(parameter) for parameter in model.fc.parameters()}
+        other_parameters = [
+            parameter for parameter in model.parameters()
+            if id(parameter) not in fc_ids
+        ]
+        parameter_groups = [
+            {"params": model.fc.parameters(), "lr": lr * 0.1},
+            {"params": other_parameters},
+        ]
+    else:
+        parameter_groups = model.parameters()
+
+    if optim == "Adam":
+        return torch.optim.Adam(parameter_groups, lr=lr)
+    if optim == "SGD":
+        return torch.optim.SGD(
+            parameter_groups,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    if optim == "AdamW":
+        # The official code does not pass its configured weight_decay here.
+        return torch.optim.AdamW(parameter_groups, lr=lr)
+    raise ValueError(f"optimizer: {optim} is not supported")
+
+
+def build_lr_scheduler(
+        optimizer, scheduler, epoch_num, scheduler_steps,
+        lr_min=5e-6, warmup_lr_init=5e-6, decay_rate=0.1):
+    return build_scheduler(
+        optimizer,
+        scheduler,
+        epoch_num,
+        scheduler_steps,
+        decay_rate=decay_rate,
+        lr_min=lr_min,
+        warmup_lr_init=warmup_lr_init,
+    )
+
+
+def _device_for(model):
+    return next(model.parameters()).device
+
+
+def _prepare_batch(batch, device):
+    video, audio, flow, label, _ = batch
+    return {
+        "V": video.to(device),
+        "F": flow.to(device),
+        "A": audio.to(device),
+    }, label.float().to(device)
+
+
+def _spearman(predictions, labels):
+    prediction = np.asarray(predictions, dtype=np.float64).reshape(-1)
+    target = np.asarray(labels, dtype=np.float64).reshape(-1)
+    coefficient, _ = spearmanr(prediction, target)
+    return float(coefficient)
+
+
+def train_epoch(
+        model, optimizer, lr_scheduler, dataloader,
+        current_epoch, clip_grad=False, qmd=None):
+    objective_losses = AverageMeter()
+    mse_losses = AverageMeter()
+    predictions = []
+    labels = []
+    start = time.time()
+    device = _device_for(model)
+    model.train()
+    qmd_rows = []
+
+    for batch in dataloader:
+        model_input, label = _prepare_batch(batch, device)
+        qmd_active = qmd is not None and qmd.scale(current_epoch) > 0
+        guard = getattr(qmd, 'guard', None) if qmd_active else None
+        correction = None
+        before_full = rng_state() if qmd_active else None
+        prediction, other_info = model(model_input)
+        training_loss = getattr(
+            model, "call_training_loss", model.call_loss
+        )
+        objective = training_loss(
+            prediction, label, **other_info
+        )
+        mse = torch.mean(
+            (prediction.reshape(-1) - label.reshape(-1)) ** 2
+        )
+        if qmd_active:
+            auxiliary, diagnostic = qmd.auxiliary(
+                model, model_input, batch[4], label, prediction, mse,
+                before_full, current_epoch)
+            if guard is not None:
+                guarded_parameters = [p for p in model.parameters() if p.requires_grad]
+                correction = guard.prepare(objective, qmd._grad_terms, guarded_parameters, current_epoch)
+                qmd._grad_terms = None
+            objective = objective + auxiliary
+            qmd_rows.append(diagnostic)
+        if not bool(torch.isfinite(objective)):
+            raise FloatingPointError('non-finite training objective')
+
+        optimizer.zero_grad()
+        objective.backward()
+        if correction is not None:
+            guard.apply(guarded_parameters, correction)
+        if clip_grad:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2)
+        optimizer.step()
+
+        batch_size = label.shape[0]
+        objective_losses.update(objective.item(), batch_size)
+        mse_losses.update(mse.detach().item(), batch_size)
+        predictions.extend(
+            prediction.detach().cpu().reshape(-1).tolist()
+        )
+        labels.extend(label.detach().cpu().reshape(-1).tolist())
+
+    if lr_scheduler is not None:
+        lr_scheduler.step(current_epoch + 1)
+    if getattr(qmd, 'guard', None) is not None:
+        print('GRAD ' + json.dumps(qmd.guard.epoch_report(current_epoch), sort_keys=True), flush=True)
+    if qmd is not None:
+        qmd.epoch_rows.append({
+            'epoch': current_epoch + 1, 'active_batches': len(qmd_rows),
+            'mask_gt': float(np.mean([r['mask_gt'] for r in qmd_rows])) if qmd_rows else 0.0,
+            'score_kd': float(np.mean([r['score_kd'] for r in qmd_rows])) if qmd_rows else 0.0,
+            'beta': qmd.beta, 'scale': qmd.scale(current_epoch),
+        })
+        if qmd.mode == 'score_rank_qmd':
+            qmd.epoch_rows[-1].update(
+                rank_kd=float(np.mean([r.get('rank_kd', 0.) for r in qmd_rows])) if qmd_rows else 0.,
+                eligible_pairs=sum(r.get('eligible_pairs', 0) for r in qmd_rows),
+                total_pairs=sum(r.get('total_pairs', 0) for r in qmd_rows),
+                mean_reliability=float(np.mean([r.get('mean_reliability', 0.) for r in qmd_rows]))
+                                 if qmd_rows else 0.)
+    return {
+        "time": time.time() - start,
+        "mse_x100": mse_losses.avg * 100,
+        "objective_x100": objective_losses.avg * 100,
+        # Match the official training-side scale in the epoch log.
+        "coef": _spearman(predictions, labels),
+    }
+
+
+def test_epoch(model, dataloader, return_predictions=False):
+    losses = AverageMeter()
+    predictions = []
+    labels = []
+    start = time.time()
+    device = _device_for(model)
+    model.eval()
+
+    with torch.no_grad():
+        for batch in dataloader:
+            model_input, label = _prepare_batch(batch, device)
+            prediction, other_info = model(model_input)
+            loss = model.call_loss(
+                prediction, label, **other_info
+            )
+            losses.update(loss.item(), label.shape[0])
+            predictions.extend(
+                prediction.detach().cpu().reshape(-1).tolist()
+            )
+            labels.extend(label.detach().cpu().reshape(-1).tolist())
+
+    values = np.asarray(predictions, dtype=np.float64)
+    targets = np.asarray(labels, dtype=np.float64)
+    result = {
+        "prediction_std": float(values.std()),
+        "saturation_fraction": float(np.mean((values < .001) | (values > .999))),
+        "prediction_std_ratio": float(values.std() / targets.std()),
+        "time": time.time() - start,
+        "loss_x100": losses.avg * 100,
+        "coef": _spearman(predictions, labels) * 100,
+    }
+    if return_predictions:
+        result['predictions'] = dict(label=labels, prediction=predictions, order='native_test_loader')
+    return result
+
+
+def _ensure_parent(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
+def train_loop(
+        model, optimizer, lr_scheduler,
+        train_dataloader, test_dataloader, epoch_num,
+        save_base_model="", save_final_model="", save_moniter="",
+        log_func=None, clip_grad=False, qmd=None):
+    log_func = log_func or print
+    max_coef = 0.0
+    max_avg_coef = 0.0
+    min_loss = 10.0
+    min_avg_loss = 10.0
+    coefficient_of_saved_model = 0.0
+    test_losses = []
+    test_coefs = []
+
+    for current_epoch in range(epoch_num):
+        train_result = train_epoch(
+            model,
+            optimizer,
+            lr_scheduler,
+            train_dataloader,
+            current_epoch,
+            clip_grad=clip_grad,
+            qmd=qmd,
+        )
+        before_eval = (rng_state(), np.random.get_state()) if save_final_model else None
+        test_result = test_epoch(model, test_dataloader)
+        if qmd is not None:
+            log_func('QMD ' + json.dumps(qmd.epoch_rows[-1], sort_keys=True))
+        if save_final_model:
+            _ensure_parent(save_final_model)
+            with open(save_final_model + '.epochs.jsonl', 'a', encoding='utf-8') as handle:
+                handle.write(json.dumps(dict(epoch=current_epoch + 1, **test_result), sort_keys=True) + '\n')
+        test_losses.append(test_result["loss_x100"])
+        test_coefs.append(test_result["coef"])
+        average_loss = np.mean(test_losses[-10:])
+        average_coef = np.mean(test_coefs[-10:])
+
+        if save_base_model:
+            better = (
+                save_moniter == "avg_coef"
+                and average_coef > max_avg_coef
+            ) or (
+                save_moniter == "avg_loss"
+                and average_loss < min_avg_loss
+            )
+            if better:
+                _ensure_parent(save_base_model)
+                torch.save(model, save_base_model)
+                coefficient_of_saved_model = test_result["coef"]
+
+        if save_final_model and test_result["coef"] > max_coef:
+            _ensure_parent(save_final_model)
+            torch.save(model.state_dict(), save_final_model)
+            # Capture the original stochastic test draw, not a new random replay.
+            torch.save(before_eval, save_final_model + '.eval_rng.pt')
+            with open(save_final_model + '.selection.json', 'w', encoding='utf-8') as handle:
+                json.dump(dict(epoch=current_epoch + 1, **test_result), handle, indent=2, sort_keys=True)
+            coefficient_of_saved_model = test_result["coef"]
+
+        max_coef = max(max_coef, test_result["coef"])
+        max_avg_coef = max(max_avg_coef, average_coef)
+        min_loss = min(min_loss, test_result["loss_x100"])
+        min_avg_loss = min(min_avg_loss, average_loss)
+        log_func(
+            "Epoch[{0}/{1}] \t"
+            "Time: {train_time:.1f}/{test_time:.1f} \t"
+            "Loss {train_loss:.4f}/{test_loss:.4f} \t"
+            "Objective {objective:.4f} \t"
+            "Avg_loss {avg_loss:.2f}/{min_avg_loss:.2f}\t"
+            "Coef {train_coef:.2f}/{test_coef:.2f} \t"
+            "Avg_coef {avg_coef:.2f}/{max_avg_coef:.2f} \t"
+            "BestCoef {max_coef:.2f}\t BestLoss {min_loss:.2f}\t".format(
+                current_epoch,
+                epoch_num,
+                train_time=train_result["time"],
+                test_time=test_result["time"],
+                train_loss=train_result["mse_x100"],
+                test_loss=test_result["loss_x100"],
+                objective=train_result["objective_x100"],
+                avg_loss=average_loss,
+                min_avg_loss=min_avg_loss,
+                train_coef=train_result["coef"],
+                test_coef=test_result["coef"],
+                avg_coef=average_coef,
+                max_avg_coef=max_avg_coef,
+                max_coef=max_coef,
+                min_loss=min_loss,
+            )
+        )
+
+    return (
+        max_avg_coef,
+        max_coef,
+        min_avg_loss,
+        min_loss,
+        coefficient_of_saved_model,
+    )
+
+
+def go(
+        model_kwargs, optimizer_kwargs, lr_scheduler_kwargs,
+        dataset_kwargs, epoch_num, save_base_model="",
+        save_final_model="", save_moniter="", log_func=None,
+        seed=0, clip_grad=False, qmd_config=None, qmd_report_path=""):
+    log_func = log_func or print
+    setup_seed(seed)
+    train_loader, test_loader = build_dataset(**dataset_kwargs)
+    model = build_model(**model_kwargs)
+    optimizer = build_optimizer(
+        model,
+        model_name=model_kwargs["model_name"],
+        **optimizer_kwargs,
+    )
+    scheduler = build_lr_scheduler(
+        optimizer, **lr_scheduler_kwargs
+    )
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    model.to(device)
+    qmd = ScoreQMD(seed=seed, epochs=epoch_num, **qmd_config) if qmd_config else None
+    results = train_loop(
+        model,
+        optimizer,
+        scheduler,
+        train_loader,
+        test_loader,
+        epoch_num=epoch_num,
+        save_base_model=save_base_model,
+        save_moniter=save_moniter,
+        save_final_model=save_final_model,
+        log_func=log_func,
+        clip_grad=clip_grad,
+        qmd=qmd,
+    )
+    if qmd is not None and qmd_report_path:
+        _ensure_parent(qmd_report_path)
+        with open(qmd_report_path, 'w', encoding='utf-8') as handle:
+            json.dump(qmd.summary(), handle, indent=2, sort_keys=True)
+    log_func(
+        f"best avg coef: {results[0] / 100:.4f}\t"
+        f"best coef: {results[1] / 100:.4f}\t"
+        f"min avg loss: {results[2] / 100:.6f}\t"
+        f"min loss: {results[3] / 100:.6f}\t"
+        "coef of saved model: "
+        f"{results[4] / 100:.4f}"
+    )
+    return results
+
+
+def _load_state_dict(path):
+    try:
+        value = torch.load(
+            path, map_location="cpu", weights_only=False
+        )
+    except TypeError:
+        value = torch.load(path, map_location="cpu")
+    if isinstance(value, dict) and "state_dict" in value:
+        return value["state_dict"]
+    return value
+
+
+def test_model(
+        model_kwargs, dataset_kwargs, ckpt_path="",
+        log_func=None, seed=0, replay_rng_path="", return_predictions=False):
+    log_func = log_func or print
+    setup_seed(seed)
+    _, test_loader = build_dataset(**dataset_kwargs)
+    model = build_model(**model_kwargs)
+    model.load_state_dict(_load_state_dict(ckpt_path))
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+    model.to(device)
+    if replay_rng_path:
+        saved_rng = _load_state_dict(replay_rng_path)
+        set_rng_state(saved_rng[0])
+        np.random.set_state(saved_rng[1])
+    result = (test_epoch(model, test_loader, return_predictions=True) if return_predictions
+              else test_epoch(model, test_loader))
+    result['evaluation'] = dict(policy='legacy_gumbel', replayed_rng=bool(replay_rng_path))
+    log_func(
+        f"Coef: {result['coef'] / 100:.4f}\t"
+        f"Loss: {result['loss_x100'] / 100:.6f}"
+    )
+    return result
+
+
+def print_flops(model_kwargs):
+    from thop import clever_format, profile
+
+    model = build_model(**model_kwargs)
+    data_in = {
+        "V": torch.zeros(1, 70, 1024),
+        "F": torch.zeros(1, 70, 1024),
+        "A": torch.zeros(1, 70, 768),
+    }
+    macs, params = profile(model, inputs=(data_in,))
+    return clever_format([macs, params], "%.3f")
+
+
+def setup_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def log_info(info, logger=None, print_log=True):
+    if logger is not None:
+        logger.info(info)
+    elif print_log:
+        print(info)

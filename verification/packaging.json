@@ -1,0 +1,26 @@
+{
+  "source_integrity": "PASS",
+  "preserved_files": 118,
+  "python38_syntax_files": 106,
+  "bash_syntax": "PASS",
+  "gitignore_expected_sources": "PASS",
+  "high_confidence_credential_pattern_scan": "No matches in source files or reachable bundle blobs; not a guarantee of absence of all sensitive data",
+  "historical_blobs_scanned": 359,
+  "training_changes": false,
+  "gpu_reproduction": "NOT RUN: packaging task",
+  "external_dependency": "Original v17_history.zip, data/pretrained files and v29 checkpoints are not included",
+  "cpu_synthetic_tests": {
+    "date": "2026-10-05",
+    "v29_synthetic_orchestration": {
+      "run": 14,
+      "passed": 14,
+      "failed": 0
+    },
+    "v30_model_tests": {
+      "state": "not_run",
+      "reason": "Local Python lacks timm; no packages installed and no training source altered."
+    },
+    "environment_scope": "Local Windows CPU packaging verification, not the historical Linux CUDA environment",
+    "gpu_training": "not_run"
+  }
+}
